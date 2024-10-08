@@ -2,7 +2,7 @@ import os
 import tkinter as tk
 from tkinter import filedialog, messagebox
 
-from pytube import YouTube
+from pytubefix import YouTube
 
 
 def download_video():
@@ -12,11 +12,7 @@ def download_video():
         messagebox.showerror("Error", "Please enter a YouTube URL")
         return
     try:
-        yt = YouTube(url)
-        stream = yt.streams.get_highest_resolution()
-
-        default_file_name = stream.default_filename
-        _, default_extension = os.path.splitext(default_file_name)
+        yt = YouTube(url, "WEB_CREATOR")
 
         file_path = filedialog.asksaveasfilename(
             initialfile=default_file_name,
