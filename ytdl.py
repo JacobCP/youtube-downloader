@@ -12,7 +12,7 @@ def download_video():
         messagebox.showerror("Error", "Please enter a YouTube URL")
         return
     try:
-        yt = YouTube(url, "WEB_CREATOR")
+        yt = YouTube(url)
 
         media_type = download_type.get()
         if media_type == "audio":
