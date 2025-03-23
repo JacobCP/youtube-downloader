@@ -2,9 +2,18 @@ import os
 import subprocess
 import tkinter as tk
 from tkinter import filedialog, messagebox
+import traceback
+from datetime import datetime
 
 from pytubefix import YouTube
 
+def write_error_log(error):
+    with open('problems.log', 'a') as f:
+        f.write(f"\n--- Error occurred at {datetime.now().strftime('%Y-%m-%d %H:%M:%S')} ---\n")
+        f.write(f"Error message: {str(error)}\n")
+        f.write("Full traceback:\n")
+        f.write(traceback.format_exc())
+        f.write("\n")
 
 def download_video():
     status_label.config(text="")  # Clear previous status
@@ -63,7 +72,11 @@ def download_video():
         status_label.config(text="Video downloaded successfully!")
         os.startfile(directory)
     except Exception as e:
-        messagebox.showerror("Error", f"Failed to download video. Error: {e}")
+        if log_errors.get():
+            write_error_log(e)
+            messagebox.showerror("Error", f"Failed to download video. Error details have been written to problems.log")
+        else:
+            messagebox.showerror("Error", f"Failed to download video. Error: {e}")
 
 
 # Set up the GUI
@@ -83,18 +96,21 @@ url_entry.grid(row=0, column=1, pady=5)
 download_type = tk.StringVar(value="video")  # default option is video
 
 video_radio = tk.Radiobutton(frame, text="Video", variable=download_type, value="video")
-audio_radio = tk.Radiobutton(
-    frame, text="Audio (MP3)", variable=download_type, value="audio"
-)
+audio_radio = tk.Radiobutton(frame, text="Audio", variable=download_type, value="audio")
 
 video_radio.grid(row=1, column=0, pady=5, sticky="w")
 audio_radio.grid(row=1, column=1, pady=5, sticky="w")
 
+# Add checkbox for error logging
+log_errors = tk.BooleanVar(value=False)
+error_logging_cb = tk.Checkbutton(frame, text="Output detailed errors to log file", variable=log_errors)
+error_logging_cb.grid(row=2, column=0, columnspan=2, pady=5, sticky="w")
+
 download_button = tk.Button(frame, text="Download", command=download_video)
-download_button.grid(row=2, column=0, columnspan=2, pady=5)
+download_button.grid(row=3, column=0, columnspan=2, pady=5)
 
 # Status label for displaying messages
 status_label = tk.Label(frame, text="")
-status_label.grid(row=3, column=0, columnspan=2, pady=5)
+status_label.grid(row=4, column=0, columnspan=2, pady=5)
 
 root.mainloop()
