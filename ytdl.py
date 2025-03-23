@@ -1,4 +1,5 @@
 import os
+import subprocess
 import tkinter as tk
 from tkinter import filedialog, messagebox
 
@@ -12,6 +13,23 @@ def download_video():
         messagebox.showerror("Error", "Please enter a YouTube URL")
         return
     try:
+        # check if we can access the url
+        curl_command = [
+            "curl",
+            "-s",  # silent mode
+            "-k",  # allow insecure connections
+            "-o", "/dev/null",  # redirect output to /dev/null
+            "-w", "%{http_code}",  # write out the status code
+            url,
+        ]
+        result = subprocess.run(curl_command, capture_output=True, text=True).stdout
+        if not result.isnumeric():
+            messagebox.showerror("Error", "Could not verify URL access")
+            return
+        if int(result) >= 300 and int(result) < 400:
+            messagebox.showerror("Error", "It seems you don't have access to that URL")
+            return
+
         yt = YouTube(url)
 
         media_type = download_type.get()
