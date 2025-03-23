@@ -34,15 +34,13 @@ def download_video():
 
         media_type = download_type.get()
         if media_type == "audio":
-            stream = yt.streams.filter(only_audio=True).first()
-            default_file_name = stream.default_filename.replace(".mp4", ".mp3")
-            filetypes = [("Audio files", "*.mp3")]
+            stream = yt.streams.filter(only_audio=True, subtype="mp4").order_by('abr').desc().first()      
         elif media_type == "video":
             stream = yt.streams.get_highest_resolution()
-            default_file_name = stream.default_filename
-            filetypes = [("Video files", "*.mp4")]
-
+        
+        default_file_name = stream.default_filename
         default_extension = os.path.splitext(default_file_name)[1]
+        filetypes = [(f"*{default_extension}", f"*{default_extension}")]
 
         file_path = filedialog.asksaveasfilename(
             initialfile=default_file_name,
