@@ -1,82 +1,107 @@
 import os
+import sys
 import subprocess
 import tkinter as tk
 from tkinter import filedialog, messagebox
-import traceback
-from datetime import datetime
 
-from pytubefix import YouTube
-
-def write_error_log(error):
-    with open('problems.log', 'a') as f:
-        f.write(f"\n--- Error occurred at {datetime.now().strftime('%Y-%m-%d %H:%M:%S')} ---\n")
-        f.write(f"Error message: {str(error)}\n")
-        f.write("Full traceback:\n")
-        f.write(traceback.format_exc())
-        f.write("\n")
+def get_yt_dlp_path():
+    """Get the path to yt-dlp.exe, handling both development and PyInstaller bundle"""
+    if getattr(sys, 'frozen', False):
+        # Running as PyInstaller bundle
+        base_path = sys._MEIPASS
+    else:
+        # Running as script
+        base_path = os.path.dirname(__file__)
+    
+    return os.path.join(base_path, "yt-dlp.exe")
 
 def download_video():
     status_label.config(text="")  # Clear previous status
     url = url_entry.get()
+    filename = filename_entry.get()
+    
     if not url.strip():
         messagebox.showerror("Error", "Please enter a YouTube URL")
         return
+    
+    if not filename.strip():
+        messagebox.showerror("Error", "Please enter a filename")
+        return
+    
     try:
-        # check if we can access the url
-        curl_command = [
-            "curl",
-            "-s",  # silent mode
-            "-k",  # allow insecure connections
-            "-o", "/dev/null",  # redirect output to /dev/null
-            "-w", "%{http_code}",  # write out the status code
-            url,
-        ]
-        result = subprocess.run(curl_command, capture_output=True, text=True).stdout
-        if not result.isnumeric():
-            messagebox.showerror("Error", "Could not verify URL access")
-            return
-        if int(result) >= 300 and int(result) < 400:
-            messagebox.showerror("Error", "It seems you don't have access to that URL")
-            return
-
-        yt = YouTube(url)
-
-        media_type = download_type.get()
-        if media_type == "audio":
-            stream = yt.streams.filter(only_audio=True, subtype="mp4").order_by('abr').desc().first()      
-        elif media_type == "video":
-            stream = yt.streams.get_highest_resolution()
-        
-        default_file_name = stream.default_filename
-        default_extension = os.path.splitext(default_file_name)[1]
-        filetypes = [(f"*{default_extension}", f"*{default_extension}")]
-
-        file_path = filedialog.asksaveasfilename(
-            initialfile=default_file_name,
-            defaultextension=default_extension,
-            filetypes=filetypes,
-        )
-
-        if not file_path:
-            messagebox.showerror("Error", "No file chosen")
+        # Let user choose download directory
+        download_dir = filedialog.askdirectory(title="Choose download folder")
+        if not download_dir:
+            messagebox.showerror("Error", "No folder chosen")
             return
 
         # Show a message that download has started
         messagebox.showinfo("Download", "The download will start shortly")
 
-        # Extract directory and filename separately from file_path
-        directory, filename = os.path.split(file_path)
-
-        stream.download(output_path=directory, filename=filename)
-
-        status_label.config(text="Video downloaded successfully!")
-        os.startfile(directory)
-    except Exception as e:
-        if log_errors.get():
-            write_error_log(e)
-            messagebox.showerror("Error", f"Failed to download video. Error details have been written to problems.log")
+        media_type = download_type.get()
+        
+        # Clean filename (remove invalid characters)
+        clean_filename = filename.strip()
+        invalid_chars = '<>:"/\\|?*'
+        for char in invalid_chars:
+            clean_filename = clean_filename.replace(char, '_')
+        
+        # Determine file extension and build full path
+        if media_type == "audio":
+            file_extension = ".mp3"
         else:
-            messagebox.showerror("Error", f"Failed to download video. Error: {e}")
+            file_extension = ".mp4"
+        
+        # Ensure filename doesn't already have the extension
+        if not clean_filename.lower().endswith(file_extension.lower()):
+            clean_filename += file_extension
+        
+        full_file_path = os.path.join(download_dir, clean_filename)
+        
+        # Build yt-dlp command with user-specified filename
+        cmd = [
+            get_yt_dlp_path(),
+            "--no-check-certificate",
+            "-o", full_file_path,
+            url
+        ]
+        
+        if media_type == "audio":
+            cmd.extend([
+                "--extract-audio",
+                "--audio-format", "mp3",
+                "--audio-quality", "0"  # best quality
+            ])
+        else:
+            cmd.extend([
+                "--format", "best[height<=1080]/best"  # best quality available
+            ])
+
+        # Run yt-dlp
+        result = subprocess.run(cmd, capture_output=True, text=True, creationflags=subprocess.CREATE_NO_WINDOW)
+        
+        if result.returncode != 0:
+            error_msg = result.stderr if result.stderr else "Unknown error occurred"
+            my_msg = (
+                "Video download failed.\n\n"
+                "Is the url correct?\n"
+                "Is the video allowed by your filtering settings?\n\n"
+                "Still not working?\nTry downloading the latest version from tinyurl.com/youtubekosherdl\n\n"
+                "Still not working?\nlet whoever gave you this program know.\n\n"
+            )
+            raise Exception(my_msg)
+
+        status_label.config(text="Download completed successfully!")
+        
+        # Highlight the downloaded file in Windows Explorer
+        if os.path.exists(full_file_path):
+            subprocess.run(f'explorer /select,"{os.path.abspath(full_file_path)}"', shell=True)
+        else:
+            # Fallback to opening the directory if file doesn't exist
+            os.startfile(download_dir)
+        
+    except Exception as e:
+        messagebox.showerror("Error", e)
 
 
 # Set up the GUI
@@ -92,19 +117,21 @@ url_label.grid(row=0, column=0, pady=5)
 url_entry = tk.Entry(frame, width=50)
 url_entry.grid(row=0, column=1, pady=5)
 
+# Filename input
+filename_label = tk.Label(frame, text="Filename:")
+filename_label.grid(row=1, column=0, pady=5)
+
+filename_entry = tk.Entry(frame, width=50)
+filename_entry.grid(row=1, column=1, pady=5)
+
 # Radio button setup for selecting download type
 download_type = tk.StringVar(value="video")  # default option is video
 
 video_radio = tk.Radiobutton(frame, text="Video", variable=download_type, value="video")
 audio_radio = tk.Radiobutton(frame, text="Audio", variable=download_type, value="audio")
 
-video_radio.grid(row=1, column=0, pady=5, sticky="w")
-audio_radio.grid(row=1, column=1, pady=5, sticky="w")
-
-# Add checkbox for error logging
-log_errors = tk.BooleanVar(value=False)
-error_logging_cb = tk.Checkbutton(frame, text="Output detailed errors to log file", variable=log_errors)
-error_logging_cb.grid(row=2, column=0, columnspan=2, pady=5, sticky="w")
+video_radio.grid(row=2, column=0, pady=5, sticky="w")
+audio_radio.grid(row=2, column=1, pady=5, sticky="w")
 
 download_button = tk.Button(frame, text="Download", command=download_video)
 download_button.grid(row=3, column=0, columnspan=2, pady=5)
