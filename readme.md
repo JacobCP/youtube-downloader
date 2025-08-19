@@ -17,7 +17,6 @@ Easy to package it as an .exe file using pyinstaller.
 
 ## Features
 - Simple GUI interface for entering YouTube URLs
-- User-specified filenames
 - Download as video (MP4) or audio (MP3)
 - File highlighting in Windows Explorer after download
 - Uses --no-check-certificate for better compatibility
