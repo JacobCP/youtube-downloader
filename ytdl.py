@@ -3,7 +3,7 @@ import sys
 import subprocess
 import tkinter as tk
 from tkinter import filedialog, messagebox
-import glob
+import traceback
 
 def get_yt_dlp_path():
     """Get the path to yt-dlp.exe, handling both development and PyInstaller bundle"""
@@ -73,6 +73,11 @@ def download_video():
                 "Still not working?\nTry downloading the latest version from tinyurl.com/youtubekosherdl\n\n"
                 "Still not working?\nlet whoever gave you this program know.\n\n"
             )
+            
+            # If full errors checkbox is checked, append the full error details
+            if show_full_errors.get():
+                my_msg += f"Full error details:\n{error_msg}"
+            
             raise Exception(my_msg)
 
         # Extract the actual file path from stdout
@@ -95,8 +100,12 @@ def download_video():
             # Fallback to opening the directory
             os.startfile(download_dir)
         
-    except Exception as e:
-        messagebox.showerror("Error", e)
+    except Exception as error_message:
+        # If full errors checkbox is checked, append the full traceback
+        if show_full_errors.get():
+            error_message = f"Full traceback:\n{traceback.format_exc()}"
+        
+        messagebox.showerror("Error", error_message)
 
 
 # Set up the GUI
@@ -121,11 +130,16 @@ audio_radio = tk.Radiobutton(frame, text="Audio", variable=download_type, value=
 video_radio.grid(row=1, column=0, pady=5, sticky="w")
 audio_radio.grid(row=1, column=1, pady=5, sticky="w")
 
+# Checkbox for showing full error details
+show_full_errors = tk.BooleanVar(value=False)  # default is unchecked
+error_checkbox = tk.Checkbutton(frame, text="output full errors", variable=show_full_errors, font=("Arial", 8))
+error_checkbox.grid(row=2, column=0, columnspan=2, pady=2, sticky="w")
+
 download_button = tk.Button(frame, text="Download", command=download_video)
-download_button.grid(row=2, column=0, columnspan=2, pady=5)
+download_button.grid(row=3, column=0, columnspan=2, pady=5)
 
 # Status label for displaying messages
 status_label = tk.Label(frame, text="")
-status_label.grid(row=3, column=0, columnspan=2, pady=5)
+status_label.grid(row=4, column=0, columnspan=2, pady=5)
 
 root.mainloop()
