@@ -3,6 +3,7 @@ import sys
 import subprocess
 import tkinter as tk
 from tkinter import filedialog, messagebox
+import traceback
 
 def get_yt_dlp_path():
     """Get the path to yt-dlp.exe, handling both development and PyInstaller bundle"""
@@ -18,14 +19,9 @@ def get_yt_dlp_path():
 def download_video():
     status_label.config(text="")  # Clear previous status
     url = url_entry.get()
-    filename = filename_entry.get()
     
     if not url.strip():
         messagebox.showerror("Error", "Please enter a YouTube URL")
-        return
-    
-    if not filename.strip():
-        messagebox.showerror("Error", "Please enter a filename")
         return
     
     try:
@@ -40,29 +36,17 @@ def download_video():
 
         media_type = download_type.get()
         
-        # Clean filename (remove invalid characters)
-        clean_filename = filename.strip()
-        invalid_chars = '<>:"/\\|?*'
-        for char in invalid_chars:
-            clean_filename = clean_filename.replace(char, '_')
+        # Use yt-dlp template to automatically use YouTube title
+        # %(title)s will be replaced with the actual video title
+        # yt-dlp will automatically clean invalid characters
+        output_template = os.path.join(download_dir, "%(title)s.%(ext)s")
         
-        # Determine file extension and build full path
-        if media_type == "audio":
-            file_extension = ".mp3"
-        else:
-            file_extension = ".mp4"
-        
-        # Ensure filename doesn't already have the extension
-        if not clean_filename.lower().endswith(file_extension.lower()):
-            clean_filename += file_extension
-        
-        full_file_path = os.path.join(download_dir, clean_filename)
-        
-        # Build yt-dlp command with user-specified filename
+        # Build yt-dlp command with automatic title
         cmd = [
             get_yt_dlp_path(),
             "--no-check-certificate",
-            "-o", full_file_path,
+            "-o", output_template,
+            "--print", "after_move:filepath",  # This prints the actual file path to stdout
             url
         ]
         
@@ -89,19 +73,39 @@ def download_video():
                 "Still not working?\nTry downloading the latest version from tinyurl.com/youtubekosherdl\n\n"
                 "Still not working?\nlet whoever gave you this program know.\n\n"
             )
+            
+            # If full errors checkbox is checked, append the full error details
+            if show_full_errors.get():
+                my_msg += f"Full error details:\n{error_msg}"
+            
             raise Exception(my_msg)
 
+        # Extract the actual file path from stdout
+        # yt-dlp prints the filepath to stdout when using --print after_move:filepath
+        actual_file_path = None
+        if result.stdout:
+            # Get the last non-empty line from stdout (the filepath)
+            stdout_lines = [line.strip() for line in result.stdout.strip().split('\n') if line.strip()]
+            if stdout_lines:
+                actual_file_path = stdout_lines[-1]
+        
         status_label.config(text="Download completed successfully!")
         
         # Highlight the downloaded file in Windows Explorer
-        if os.path.exists(full_file_path):
-            subprocess.run(f'explorer /select,"{os.path.abspath(full_file_path)}"', shell=True)
+        if actual_file_path and os.path.exists(actual_file_path):
+            if media_type == "audio":
+                actual_file_path = actual_file_path.replace(".mp4", ".mp3")
+            subprocess.run(f'explorer /select,"{os.path.abspath(actual_file_path)}"', shell=True)
         else:
-            # Fallback to opening the directory if file doesn't exist
+            # Fallback to opening the directory
             os.startfile(download_dir)
         
-    except Exception as e:
-        messagebox.showerror("Error", e)
+    except Exception as error_message:
+        # If full errors checkbox is checked, append the full traceback
+        if show_full_errors.get():
+            error_message = f"Full traceback:\n{traceback.format_exc()}"
+        
+        messagebox.showerror("Error", error_message)
 
 
 # Set up the GUI
@@ -117,21 +121,19 @@ url_label.grid(row=0, column=0, pady=5)
 url_entry = tk.Entry(frame, width=50)
 url_entry.grid(row=0, column=1, pady=5)
 
-# Filename input
-filename_label = tk.Label(frame, text="Filename:")
-filename_label.grid(row=1, column=0, pady=5)
-
-filename_entry = tk.Entry(frame, width=50)
-filename_entry.grid(row=1, column=1, pady=5)
-
 # Radio button setup for selecting download type
 download_type = tk.StringVar(value="video")  # default option is video
 
 video_radio = tk.Radiobutton(frame, text="Video", variable=download_type, value="video")
 audio_radio = tk.Radiobutton(frame, text="Audio", variable=download_type, value="audio")
 
-video_radio.grid(row=2, column=0, pady=5, sticky="w")
-audio_radio.grid(row=2, column=1, pady=5, sticky="w")
+video_radio.grid(row=1, column=0, pady=5, sticky="w")
+audio_radio.grid(row=1, column=1, pady=5, sticky="w")
+
+# Checkbox for showing full error details
+show_full_errors = tk.BooleanVar(value=False)  # default is unchecked
+error_checkbox = tk.Checkbutton(frame, text="output full errors", variable=show_full_errors, font=("Arial", 8))
+error_checkbox.grid(row=2, column=0, columnspan=2, pady=2, sticky="w")
 
 download_button = tk.Button(frame, text="Download", command=download_video)
 download_button.grid(row=3, column=0, columnspan=2, pady=5)
