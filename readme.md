@@ -13,7 +13,7 @@ But it's designed not to override/bypass content filters, by first checking if t
 If it does, it will show an error message and not attempt to download.
 
 Easy to package it as an .exe file using pyinstaller.  
-`pyinstaller --onefile --noconsole --add-data "yt-dlp.exe;." ytdl.py`
+`pyinstaller --onefile --noconsole --add-data "yt-dlp.exe;." --add-data "ffmpeg.exe;." --add-data "ffprobe.exe;." ytdl.py`
 
 ## Features
 - Simple GUI interface for entering YouTube URLs
