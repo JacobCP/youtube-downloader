@@ -18,5 +18,14 @@ Easy to package it as an .exe file using pyinstaller.
 ## Features
 - Simple GUI interface for entering YouTube URLs
 - Download as video (MP4) or audio (MP3)
+- Quality choice: HD (up to 1080p) or a small 360p file
+- Downloads run in the background, so the window stays responsive
 - File highlighting in Windows Explorer after download
 - Uses --no-check-certificate for better compatibility
+
+## A note on quality
+YouTube only serves one pre-muxed (video+audio) stream, at 360p - the old 720p one
+was retired. Everything above 360p arrives as separate video and audio streams, so
+the HD option relies on the bundled ffmpeg.exe to merge them. That merge is why
+ffmpeg.exe and ffprobe.exe have to ship alongside yt-dlp.exe, and why an HD download
+takes noticeably longer than a 360p one.
