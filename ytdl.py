@@ -1,9 +1,10 @@
 import os
 import sys
 import subprocess
+import tempfile
 import threading
 import tkinter as tk
-from tkinter import filedialog, messagebox
+from tkinter import filedialog, messagebox, ttk
 import traceback
 
 def get_bundle_dir():
@@ -36,7 +37,7 @@ QUALITY_FORMATS = {
     "small": "b[height<=?360]/bv*[height<=?360]+ba/bv*+ba/b",
 }
 
-def build_command(url, output_template, media_type, quality_choice):
+def build_command(url, output_template, media_type, quality_choice, path_file):
     """Build the yt-dlp command line for a download"""
     cmd = [
         get_yt_dlp_path(),
@@ -45,7 +46,14 @@ def build_command(url, output_template, media_type, quality_choice):
         # point at it explicitly rather than relying on PATH
         "--ffmpeg-location", get_bundle_dir(),
         "-o", output_template,
-        "--print", "after_move:filepath",  # This prints the actual file path to stdout
+        # Report the finished file's path into path_file rather than to stdout.
+        # yt-dlp writes stdout using the console codepage with errors="ignore",
+        # which silently deletes any character that codepage lacks - so a title
+        # like "Café 日本" came back as a path that did not exist on disk and we
+        # fell back to opening the folder. --print-to-file is always UTF-8.
+        # "after_move" runs after post-processing, so this is the final file
+        # (the .mp3 for audio downloads, the merged .mp4 for HD).
+        "--print-to-file", "after_move:filepath", path_file,
         url
     ]
 
@@ -82,7 +90,7 @@ def download_video():
         messagebox.showerror("Error", "No folder chosen")
         return
 
-    download_button.config(state="disabled")
+    set_downloading(True)
     status_label.config(text="Downloading... this can take a while for long videos.")
 
     # Run yt-dlp off the main thread so the window stays responsive. Merging
@@ -98,13 +106,17 @@ def download_video():
 def run_download(url, download_dir, media_type, quality_choice, full_errors):
     """Background worker. Does not touch the GUI directly - results are handed
     back to the main thread with root.after()"""
+    path_file = None
     try:
         # Use yt-dlp template to automatically use YouTube title
         # %(title)s will be replaced with the actual video title
         # yt-dlp will automatically clean invalid characters
         output_template = os.path.join(download_dir, "%(title)s.%(ext)s")
 
-        cmd = build_command(url, output_template, media_type, quality_choice)
+        handle, path_file = tempfile.mkstemp(prefix="ytdl-path-", suffix=".txt")
+        os.close(handle)
+
+        cmd = build_command(url, output_template, media_type, quality_choice, path_file)
 
         # Run yt-dlp
         result = subprocess.run(cmd, capture_output=True, text=True, creationflags=subprocess.CREATE_NO_WINDOW)
@@ -125,16 +137,9 @@ def run_download(url, download_dir, media_type, quality_choice, full_errors):
 
             raise Exception(my_msg)
 
-        # Extract the actual file path from stdout
-        # yt-dlp prints the filepath to stdout when using --print after_move:filepath
-        actual_file_path = None
-        if result.stdout:
-            # Get the last non-empty line from stdout (the filepath)
-            stdout_lines = [line.strip() for line in result.stdout.strip().split('\n') if line.strip()]
-            if stdout_lines:
-                actual_file_path = stdout_lines[-1]
+        actual_file_path = read_reported_path(path_file)
 
-        root.after(0, lambda: on_download_success(actual_file_path, download_dir, media_type))
+        root.after(0, lambda: on_download_success(actual_file_path, download_dir))
 
     except Exception as error_message:
         # If full errors checkbox is checked, show the full traceback instead
@@ -147,23 +152,52 @@ def run_download(url, download_dir, media_type, quality_choice, full_errors):
         # by which point the "except ... as" name no longer exists
         root.after(0, lambda m=message: on_download_error(m))
 
-def on_download_success(actual_file_path, download_dir, media_type):
-    status_label.config(text="Download completed successfully!")
-    download_button.config(state="normal")
+    finally:
+        if path_file:
+            try:
+                os.remove(path_file)
+            except OSError:
+                pass  # nothing worth bothering the user about
 
-    # Highlight the downloaded file in Windows Explorer
+
+def read_reported_path(path_file):
+    """Read the finished file's path, which yt-dlp wrote to path_file as UTF-8"""
+    try:
+        with open(path_file, encoding="utf-8") as report:
+            lines = [line.strip() for line in report if line.strip()]
+    except OSError:
+        return None
+
+    return lines[-1] if lines else None
+
+def on_download_success(actual_file_path, download_dir):
+    set_downloading(False)
+    status_label.config(text="Download completed successfully!")
+
+    # Highlight the downloaded file in Windows Explorer. No shell=True: cmd.exe
+    # would expand %...% and & inside the filename, and YouTube titles contain
+    # both. Passing the command line straight to Windows keeps the path exact.
     if actual_file_path and os.path.exists(actual_file_path):
-        if media_type == "audio":
-            actual_file_path = actual_file_path.replace(".mp4", ".mp3")
-        subprocess.run(f'explorer /select,"{os.path.abspath(actual_file_path)}"', shell=True)
+        subprocess.run(f'explorer /select,"{os.path.abspath(actual_file_path)}"')
     else:
         # Fallback to opening the directory
         os.startfile(download_dir)
 
 def on_download_error(message):
+    set_downloading(False)
     status_label.config(text="")
-    download_button.config(state="normal")
     messagebox.showerror("Error", message)
+
+def set_downloading(is_downloading):
+    """Show the activity bar and lock the button while a download is running"""
+    if is_downloading:
+        progress_bar.grid()
+        progress_bar.start(15)
+    else:
+        progress_bar.stop()
+        progress_bar.grid_remove()
+
+    download_button.config(state="disabled" if is_downloading else "normal")
 
 def update_quality_state():
     """The resolution choice only applies to video downloads"""
@@ -214,8 +248,15 @@ error_checkbox.grid(row=3, column=0, columnspan=2, pady=2, sticky="w")
 download_button = tk.Button(frame, text="Download", command=download_video)
 download_button.grid(row=4, column=0, columnspan=2, pady=5)
 
+# Indeterminate activity bar - yt-dlp's progress is not reported back here, and
+# an HD download has three stages (video, audio, merge), so this shows that work
+# is happening rather than a percentage. Hidden until a download starts.
+progress_bar = ttk.Progressbar(frame, mode="indeterminate", length=320)
+progress_bar.grid(row=5, column=0, columnspan=2, pady=5, sticky="we")
+progress_bar.grid_remove()
+
 # Status label for displaying messages
 status_label = tk.Label(frame, text="")
-status_label.grid(row=5, column=0, columnspan=2, pady=5)
+status_label.grid(row=6, column=0, columnspan=2, pady=5)
 
 root.mainloop()

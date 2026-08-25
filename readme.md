@@ -19,7 +19,7 @@ Easy to package it as an .exe file using pyinstaller.
 - Simple GUI interface for entering YouTube URLs
 - Download as video (MP4) or audio (MP3)
 - Quality choice: HD (up to 1080p) or a small 360p file
-- Downloads run in the background, so the window stays responsive
+- Downloads run in the background, with an activity bar while they run
 - File highlighting in Windows Explorer after download
 - Uses --no-check-certificate for better compatibility
 
