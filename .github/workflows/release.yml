@@ -1,0 +1,136 @@
+name: Build and release
+
+# Checks once a day whether yt-dlp has put out a new version. If it has, builds a
+# fresh ytdl.exe and publishes it as a release. If it hasn't, stops without doing
+# anything. Can also be run by hand from the Actions tab.
+on:
+  schedule:
+    - cron: "28 20 * * *"
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: "Build only - do not publish a release"
+        type: boolean
+        default: true
+      force:
+        description: "Build even if yt-dlp has not changed"
+        type: boolean
+        default: false
+
+permissions:
+  contents: write
+
+concurrency:
+  group: release
+  cancel-in-progress: false
+
+jobs:
+  release:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Has yt-dlp changed?
+        id: check
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $ErrorActionPreference = "Stop"
+          $shipped = (Get-Content versions.json -Raw | ConvertFrom-Json).yt_dlp
+          $latest  = gh release view --repo yt-dlp/yt-dlp --json tagName --jq ".tagName"
+          if (-not $latest) { throw "could not read yt-dlp's latest release" }
+
+          Write-Host "last shipped: $shipped"
+          Write-Host "yt-dlp latest: $latest"
+
+          $needed = ($latest -ne $shipped) -or ("${{ inputs.force }}" -eq "true")
+          "latest=$latest" | Out-File $env:GITHUB_OUTPUT -Append
+          "needed=$(if ($needed) { 'yes' } else { 'no' })" | Out-File $env:GITHUB_OUTPUT -Append
+
+          if ($needed) {
+            Write-Host "::notice::Update needed - building yt-dlp $latest"
+          } else {
+            Write-Host "::notice::Already current on yt-dlp $shipped - nothing to do"
+          }
+
+      - uses: actions/setup-python@v5
+        if: steps.check.outputs.needed == 'yes'
+        with:
+          python-version: "3.12"
+
+      - name: Install PyInstaller
+        if: steps.check.outputs.needed == 'yes'
+        shell: pwsh
+        run: python -m pip install --upgrade pip pyinstaller
+
+      - name: Build
+        id: build
+        if: steps.check.outputs.needed == 'yes'
+        shell: pwsh
+        run: .\build.ps1 -YtDlpVersion "${{ steps.check.outputs.latest }}"
+
+      # --- dry run: keep the exe as a downloadable artifact, publish nothing ---
+      - name: Upload build (dry run)
+        if: steps.check.outputs.needed == 'yes' && inputs.dry_run
+        uses: actions/upload-artifact@v4
+        with:
+          name: ytdl-exe-dryrun
+          path: dist/ytdl.exe
+          retention-days: 7
+
+      # --- real run: publish, then record what went out ------------------------
+      - name: Publish release
+        id: publish
+        if: steps.check.outputs.needed == 'yes' && !inputs.dry_run
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $ErrorActionPreference = "Stop"
+
+          $last = gh release list --repo $env:GITHUB_REPOSITORY --limit 1 --json tagName --jq ".[0].tagName"
+          if ([string]::IsNullOrWhiteSpace($last)) {
+            $next = "v1.0.0"
+          } elseif ($last -match '^v?(\d+)\.(\d+)\.(\d+)$') {
+            $next = "v{0}.{1}.{2}" -f $Matches[1], $Matches[2], ([int]$Matches[3] + 1)
+          } else {
+            throw "could not parse the last release tag: $last"
+          }
+          Write-Host "publishing $next (previous: $last)"
+
+          $notes = @(
+            "yt-dlp ${{ steps.build.outputs.ytdlp_version }}",
+            "ffmpeg ${{ steps.build.outputs.ffmpeg_version }}",
+            "deno $((Get-Content versions.json -Raw | ConvertFrom-Json).deno)",
+            "",
+            "Download size: ${{ steps.build.outputs.built_mb }} MB"
+          ) -join "`n"
+
+          gh release create $next "dist/ytdl.exe" --title $next --notes $notes
+          if ($LASTEXITCODE -ne 0) { throw "gh release create failed" }
+          "tag=$next" | Out-File $env:GITHUB_OUTPUT -Append
+
+      - name: Record what shipped
+        if: steps.check.outputs.needed == 'yes' && !inputs.dry_run
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          $v = Get-Content versions.json -Raw | ConvertFrom-Json
+          $v.yt_dlp            = "${{ steps.build.outputs.ytdlp_version }}"
+          $v.ffmpeg_last_built = "${{ steps.build.outputs.ffmpeg_version }}"
+          $v | ConvertTo-Json -Depth 5 | Set-Content versions.json -Encoding utf8
+
+          git config user.name  "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add versions.json
+          git commit -m "Ship yt-dlp ${{ steps.build.outputs.ytdlp_version }} in ${{ steps.publish.outputs.tag }}"
+
+          # The release is already out; make sure this bookkeeping commit lands even
+          # if something else pushed to the branch while we were building.
+          for ($i = 1; $i -le 3; $i++) {
+            git push && exit 0
+            Write-Host "push failed, rebasing and retrying ($i/3)"
+            git pull --rebase
+          }
+          throw "could not push the updated versions.json after 3 attempts"

@@ -1,3 +1,14 @@
 dist/*
 build/*
 *.spec
+
+# Build inputs - downloaded fresh by build.ps1, never committed.
+# (See versions.json for which versions get fetched.)
+yt-dlp.exe
+ffmpeg.exe
+ffprobe.exe
+deno.exe
+*.zip
+_deno/
+_ffmpeg/
+*.dll

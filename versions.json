@@ -1,0 +1,24 @@
+{
+  "_readme": [
+    "Inputs and state for the release pipeline (.github/workflows/release.yml).",
+    "",
+    "yt_dlp            what the last release shipped. The workflow writes this itself,",
+    "                  AFTER a release succeeds, so a failed build can never mark a",
+    "                  version as shipped. This is the value the daily check compares.",
+    "deno              pinned. Bump deliberately when you want a newer deno.",
+    "ffmpeg            BtbN only serves a rolling 'latest' tag, so this cannot be pinned",
+    "                  to an immutable URL. ffmpeg_last_built records what was actually",
+    "                  used, so a change shows up as a diff line.",
+    "ffmpeg_variant    'win64-gpl' is a full static build: two self-contained 145 MB exes.",
+    "                  'win64-lgpl-shared' is far smaller (~129 MB total instead of ~291 MB)",
+    "                  because ffmpeg.exe and ffprobe.exe share one set of DLLs instead of",
+    "                  each carrying its own copy. Switch, then run the workflow as a dry",
+    "                  run and check that both video and audio downloads still work.",
+    "ffmpeg_last_built written by the workflow after each build."
+  ],
+  "yt_dlp": "2026.08.19",
+  "deno": "v2.9.5",
+  "ffmpeg": "latest",
+  "ffmpeg_variant": "win64-gpl",
+  "ffmpeg_last_built": ""
+}
