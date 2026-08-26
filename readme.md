@@ -1,22 +1,45 @@
-Simple script providing a UI to download youtube videos, in audio or video format, for Windows.  
-Uses precompiled yt-dlp.exe for downloading and tkinter for the UI.  
-Lightweight - no external Python dependencies required, just the included yt-dlp.exe.  
+Simple script providing a UI to download youtube videos, in audio or video format, for Windows.
+Uses yt-dlp for downloading and tkinter for the UI.
 
-Using yt-dlp.exe, which is the most reliable and actively maintained YouTube downloader.
-The precompiled executable handles all the complexity of YouTube's changing APIs.
+Using yt-dlp, which is the most reliable and actively maintained YouTube downloader.
+It handles all the complexity of YouTube's changing APIs.
 
 It's a game of cat and mouse - since youtube is trying to block bots.
-To stay current, simply replace the yt-dlp.exe file with the latest version from the official releases.
+Releases are rebuilt automatically whenever yt-dlp puts out a new version, so the
+newest download on the releases page is always current.
 
 In order to work, you'll need to bypass the .exe files from any content filter.
-But it's designed not to override/bypass content filters, by first checking if the url returns a redirect http code using curl.
-If it does, it will show an error message and not attempt to download.
 
-Easy to package it as an .exe file using pyinstaller.  
-`pyinstaller --onefile --noconsole --add-data "yt-dlp.exe;." --add-data "ffmpeg.exe;." --add-data "ffprobe.exe;." ytdl.py`
+## Getting it
+
+Download `ytdl.exe` from the [latest release](../../releases/latest). Everything is
+bundled inside it - there is nothing to install.
+
+The app does not update itself. When YouTube changes and downloads start failing,
+come back to the releases page and download the newest one.
+
+## Building it yourself
+
+The bundled tools (yt-dlp, ffmpeg, ffprobe, deno) are **not** kept in this repo.
+They are downloaded fresh at build time, so a clean clone always builds against
+current versions. `versions.json` records what gets fetched.
+
+    pip install pyinstaller
+    .\build.ps1
+
+That downloads the tools and produces `dist\ytdl.exe`.
+
+## How releases happen
+
+`.github/workflows/release.yml` runs once a day. It compares the yt-dlp version
+recorded in `versions.json` against yt-dlp's newest release. If they differ, it
+builds a fresh `ytdl.exe`, publishes it as a new release, and then records the
+version it shipped. If they match, it stops without doing anything.
+
+You can also run it by hand from the Actions tab. It defaults to a dry run, which
+builds the exe and attaches it to the workflow run without publishing a release.
 
 ## Features
 - Simple GUI interface for entering YouTube URLs
 - Download as video (MP4) or audio (MP3)
 - File highlighting in Windows Explorer after download
-- Uses --no-check-certificate for better compatibility
