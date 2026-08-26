@@ -1,10 +1,7 @@
 import os
 import re
-import ssl
 import sys
 import subprocess
-import urllib.error
-import urllib.request
 import tkinter as tk
 from tkinter import filedialog, messagebox
 import traceback
@@ -126,66 +123,6 @@ def diagnose(url, log_dir):
     return "\n".join(lines), log_path
 
 
-# --- checking with the content filter before doing anything --------------------
-#
-# The rule this program follows: if the filter blocks the video itself, we stop.
-# We only work around a block that is on YouTube's stream-details API rather than
-# on the video, and only after confirming the video's own page is permitted.
-
-BROWSER_UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
-              "(KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36")
-
-# Text a filter puts in its refusal page. Checked case-insensitively.
-BLOCK_SIGNATURES = ("netfree", "blocked by", "content filter", "access denied",
-                    "this site is blocked", "not permitted")
-
-
-def check_url_allowed(url):
-    """Fetch the video's own page and see whether the filter permits it.
-
-    Returns (allowed, detail). allowed is None when we could not tell - in that
-    case we do NOT work around anything, because we cannot show the video is
-    permitted. Certificate checking is off because a filter that inspects traffic
-    presents its own certificate; this matches the rest of the program."""
-    context = ssl.create_default_context()
-    context.check_hostname = False
-    context.verify_mode = ssl.CERT_NONE
-
-    request = urllib.request.Request(url, headers={"User-Agent": BROWSER_UA})
-    try:
-        with urllib.request.urlopen(request, timeout=25, context=context) as response:
-            status = response.status
-            body = response.read(80000).decode("utf-8", "replace")
-    except urllib.error.HTTPError as error:
-        body = ""
-        try:
-            body = error.read(8000).decode("utf-8", "replace")
-        except Exception:
-            pass
-        named = next((s for s in BLOCK_SIGNATURES if s in body.lower()), None)
-        return False, "the page was refused with HTTP {}{}".format(
-            error.code, " ({})".format(named) if named else "")
-    except Exception as error:
-        return None, "could not reach the page: {}".format(error)
-
-    if status >= 400:
-        return False, "the page was refused with HTTP {}".format(status)
-
-    lowered = body.lower()
-    named = next((s for s in BLOCK_SIGNATURES if s in lowered), None)
-    # A real YouTube watch page always carries the player bootstrap. A filter's
-    # refusal page will not, which is what stops a passing mention of a signature
-    # word in a video title from being mistaken for a block.
-    looks_like_youtube = "ytinitialdata" in lowered or "ytinitialplayerresponse" in lowered
-    if named and not looks_like_youtube:
-        return False, "the filter returned its own page ({})".format(named)
-
-    if not looks_like_youtube:
-        return None, "the page came back but did not look like a YouTube page"
-
-    return True, "the video's own page is permitted"
-
-
 def download_video():
     status_label.config(text="")  # Clear previous status
     url = url_entry.get()
@@ -201,21 +138,6 @@ def download_video():
         if not download_dir:
             messagebox.showerror("Error", "No folder chosen")
             return
-
-        # Before anything else: does the filter allow this video at all?
-        status_label.config(text="Checking the video is permitted...")
-        root.update_idletasks()
-        allowed, detail = check_url_allowed(url)
-        status_label.config(text="")
-
-        if allowed is False:
-            raise Exception(
-                "Not downloading.\n\n"
-                "Your content filter is blocking this video's own page - "
-                "{}.\n\n"
-                "This program does not work around a filter's decision about a "
-                "video. If you think it should be allowed, that is a question "
-                "for whoever runs the filter.".format(detail))
 
         # Show a message that download has started
         messagebox.showinfo("Download", "The download will start shortly")
@@ -233,25 +155,8 @@ def download_video():
             "--no-check-certificate",
             "-o", output_template,
             "--print", "after_move:filepath",  # This prints the actual file path to stdout
+            url
         ]
-
-        # The video's page is permitted (checked above), so take the stream details
-        # from that page instead of from YouTube's separate API address, which some
-        # filters refuse. Restricting to the "web" client is what does this: it is
-        # the only client that reads its player response out of the page yt-dlp has
-        # already downloaded, so no request to /youtubei/v1/player is made at all.
-        if allowed is True:
-            cmd.extend(["--extractor-args", "youtube:player_client=web"])
-
-        # YouTube often only puts the stream details in the page for a signed-in
-        # session, so borrow the browser's. Firefox is the default because Chrome
-        # and Edge encrypt their cookie store on Windows in a way yt-dlp cannot
-        # always read (yt-dlp issue 10927).
-        browser = cookie_browser.get().strip()
-        if browser:
-            cmd.extend(["--cookies-from-browser", browser])
-
-        cmd.append(url)
 
         if media_type == "audio":
             cmd.extend([
@@ -330,7 +235,7 @@ def looks_blocked(error_text):
 
 
 def main():
-    global root, url_entry, download_type, show_full_errors, status_label, cookie_browser
+    global root, url_entry, download_type, show_full_errors, status_label
 
     # Set up the GUI
     root = tk.Tk()
@@ -354,26 +259,17 @@ def main():
     video_radio.grid(row=1, column=0, pady=5, sticky="w")
     audio_radio.grid(row=1, column=1, pady=5, sticky="w")
 
-    # Which browser's signed-in session to borrow, if any. YouTube frequently
-    # withholds stream details from a signed-out request. Blank means don't.
-    cookie_browser = tk.StringVar(value="")
-    cookie_label = tk.Label(frame, text="Use sign-in from:", font=("Arial", 8))
-    cookie_label.grid(row=2, column=0, pady=2, sticky="w")
-    cookie_menu = tk.OptionMenu(frame, cookie_browser, "", "firefox", "chrome", "edge", "brave", "opera", "vivaldi")
-    cookie_menu.config(font=("Arial", 8))
-    cookie_menu.grid(row=2, column=1, pady=2, sticky="w")
-
     # Checkbox for showing full error details
     show_full_errors = tk.BooleanVar(value=False)  # default is unchecked
     error_checkbox = tk.Checkbutton(frame, text="output full errors", variable=show_full_errors, font=("Arial", 8))
-    error_checkbox.grid(row=3, column=0, columnspan=2, pady=2, sticky="w")
+    error_checkbox.grid(row=2, column=0, columnspan=2, pady=2, sticky="w")
 
     download_button = tk.Button(frame, text="Download", command=download_video)
-    download_button.grid(row=4, column=0, columnspan=2, pady=5)
+    download_button.grid(row=3, column=0, columnspan=2, pady=5)
 
     # Status label for displaying messages
     status_label = tk.Label(frame, text="")
-    status_label.grid(row=5, column=0, columnspan=2, pady=5)
+    status_label.grid(row=4, column=0, columnspan=2, pady=5)
 
     root.mainloop()
 

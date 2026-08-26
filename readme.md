@@ -39,26 +39,6 @@ version it shipped. If they match, it stops without doing anything.
 You can also run it by hand from the Actions tab. It defaults to a dry run, which
 builds the exe and attaches it to the workflow run without publishing a release.
 
-## What it will and won't do around a content filter
-
-Before downloading, the app fetches the video's own watch page and checks whether
-your filter permits it.
-
-- **Page blocked** - it stops and downloads nothing. A filter's decision about a
-  video is left alone.
-- **Page permitted** - it takes the stream details from that same page rather than
-  from `https://www.youtube.com/youtubei/v1/player`, which some filters refuse even
-  for videos they allow. This is `--extractor-args youtube:player_client=web`: the
-  `web` client is the only one that reads its player response out of the page
-  yt-dlp has already fetched, so that address is never contacted.
-- **Can't tell** - it makes no attempt to work around anything, since it cannot
-  show the video is permitted.
-
-YouTube often withholds stream details from a signed-out request. "Use sign-in
-from" borrows your browser's YouTube session so the page arrives complete. Prefer
-Firefox: Chrome and Edge encrypt their cookie store on Windows in a way yt-dlp
-often cannot read.
-
 ## When a content filter blocks it
 
 If a download fails because something rejected a request, the app re-runs the
