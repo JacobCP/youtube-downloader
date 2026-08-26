@@ -39,6 +39,19 @@ version it shipped. If they match, it stops without doing anything.
 You can also run it by hand from the Actions tab. It defaults to a dry run, which
 builds the exe and attaches it to the workflow run without publishing a release.
 
+## When a content filter blocks it
+
+If a download fails because something rejected a request, the app re-runs the
+extraction with traffic logging and tells you the exact addresses that were
+refused, along with their HTTP status. It also writes `ytdl-diagnostic.log` into
+your chosen download folder, with cookies stripped out so it is safe to pass on.
+
+This matters because a filter can allow the video itself while still refusing the
+address yt-dlp needs to fetch the stream details - typically
+`https://www.youtube.com/youtubei/v1/player`. The error on its own says only
+"Unable to download API page", which is not enough to ask for the address to be
+allowed.
+
 ## Features
 - Simple GUI interface for entering YouTube URLs
 - Download as video (MP4) or audio (MP3)

@@ -12,3 +12,5 @@ deno.exe
 _deno/
 _ffmpeg/
 *.dll
+__pycache__/
+*.pyc
