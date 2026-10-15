@@ -1,6 +1,7 @@
 import os
 import re
 import sys
+import platform
 import time
 import queue
 import tempfile
@@ -222,7 +223,7 @@ POSTPROCESSOR_STAGES = {
 }
 
 
-def build_command(url, download_dir, media_type, quality, path_file):
+def build_command(url, download_dir, media_type, quality, path_file, verbose=False):
     """Build the yt-dlp command line for a download"""
     cmd = [
         get_yt_dlp_path(),
@@ -259,6 +260,11 @@ def build_command(url, download_dir, media_type, quality, path_file):
             "--format-sort", FORMAT_SORT,
             "--merge-output-format", "mp4/mkv",
         ])
+
+    if verbose:
+        # Versions, the exact options in effect and each step yt-dlp takes - the
+        # detail needed to work out why a download failed
+        cmd.append("--verbose")
 
     # "--" so a pasted link can never be mistaken for an option
     cmd.extend(["--", url])
@@ -314,6 +320,21 @@ def format_duration(seconds):
     if hours:
         return "{}:{:02d}:{:02d}".format(hours, minutes, secs)
     return "{}:{:02d}".format(minutes, secs)
+
+
+# yt-dlp ends most errors with a request to file a bug report, which is noise here
+_REPORT_RE = re.compile(r";?\s*please report this issue on .*$", re.IGNORECASE)
+
+
+def explain_failure(output):
+    """Pull the lines that say what went wrong out of yt-dlp's output"""
+    errors, warnings = [], []
+    for line in output.splitlines():
+        if line.startswith("ERROR:"):
+            errors.append(_REPORT_RE.sub("", line[len("ERROR:"):]).strip())
+        elif line.startswith("WARNING:"):
+            warnings.append(_REPORT_RE.sub("", line[len("WARNING:"):]).strip())
+    return errors, warnings
 
 
 def looks_blocked(error_text):
@@ -393,6 +414,7 @@ class Download:
         self.process = None
         self.cancelled = False
         self.started_at = time.time()
+        self.log = []  # everything yt-dlp printed, apart from progress lines
 
     def start(self):
         threading.Thread(target=self._run, daemon=True).start()
@@ -412,21 +434,20 @@ class Download:
             os.close(handle)
 
             cmd = build_command(self.url, self.download_dir, self.media_type,
-                                self.quality, path_file)
+                                self.quality, path_file, verbose=self.full_errors)
             self.process = subprocess.Popen(
                 cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
                 stdin=subprocess.DEVNULL, text=True, errors="replace",
                 creationflags=NO_WINDOW,
             )
 
-            log = []
             for line in self.process.stdout:
                 line = line.rstrip()
                 update = parse_progress(line)
                 if update:
                     self.messages.put(("progress", update))
                 elif line:
-                    log.append(line)
+                    self.log.append(line)
             self.process.wait()
 
             if self.cancelled:
@@ -435,7 +456,7 @@ class Download:
                 return
 
             if self.process.returncode != 0:
-                self.messages.put(("error", self._failure_message("\n".join(log))))
+                self.messages.put(("error", self._failure_report()))
                 return
 
             reported = None
@@ -449,13 +470,15 @@ class Download:
             found = find_downloaded_file(reported, self.download_dir, self.started_at)
             self.messages.put(("done", found))
 
-        except Exception:
+        except Exception as error:
             if self.cancelled:
                 self.messages.put(("cancelled", None))
-            elif self.full_errors:
-                self.messages.put(("error", "Full traceback:\n{}".format(traceback.format_exc())))
             else:
-                self.messages.put(("error", "Something went wrong:\n{}".format(sys.exc_info()[1])))
+                summary = "Something went wrong in the program itself:\n{}".format(error)
+                self.messages.put(("error", {
+                    "summary": summary,
+                    "details": self._details([], [], crash=traceback.format_exc()),
+                }))
 
         finally:
             if path_file:
@@ -464,29 +487,62 @@ class Download:
                 except OSError:
                     pass  # nothing worth bothering the user about
 
-    def _failure_message(self, output):
-        errors = "\n".join(line for line in output.splitlines() if line.startswith("ERROR")) or output
-        message = (
+    def _failure_report(self):
+        """What to tell the user about a failed download: a plain summary, and
+        the details someone would need to work out why"""
+        output = "\n".join(self.log)
+        errors, warnings = explain_failure(output)
+        summary = (
             "Video download failed.\n\n"
             "Is the url correct?\n"
             "Is the video allowed by your filtering settings?\n\n"
             "Still not working?\nTry downloading the latest version from tinyurl.com/youtubekosherdl\n\n"
-            "Still not working?\nlet whoever gave you this program know.\n\n"
+            "Still not working?\nlet whoever gave you this program know."
         )
+        if errors:
+            summary += "\n\nWhat yt-dlp said:\n" + "\n".join(errors)
 
         # A rejected request means something in between us and YouTube said no.
         # Find out which address it was, so it can be reported or allowed.
-        if looks_blocked(errors):
+        if looks_blocked("\n".join(errors) or output):
             self.messages.put(("progress", {"kind": "checking"}))
-            summary, log_path = diagnose(self.url, self.download_dir)
-            message += summary + "\n\n"
+            diagnosis, log_path = diagnose(self.url, self.download_dir)
+            summary += "\n\n" + diagnosis
             if log_path:
-                message += "Full details saved to:\n{}\n\n".format(log_path)
+                summary += "\n\nFull details saved to:\n{}".format(log_path)
 
-        if self.full_errors:
-            message += "Full error details:\n{}".format(output or "Unknown error occurred")
+        return {"summary": summary, "details": self._details(errors, warnings)}
 
-        return message
+    def _details(self, errors, warnings, crash=None):
+        """A plain-text report that can be copied and sent to someone"""
+        quality = "audio (MP3)" if self.media_type == "audio" else "video, {} ({})".format(
+            QUALITIES[self.quality]["label"], QUALITIES[self.quality]["detail"])
+        lines = ["What went wrong:"]
+        if errors:
+            lines += ["  " + error for error in errors]
+        elif crash:
+            lines += ["  " + crash.strip().splitlines()[-1]]
+        else:
+            exit_code = self.process.returncode if self.process else "?"
+            lines += ["  yt-dlp stopped with exit code {} without saying why".format(exit_code)]
+        if warnings:
+            lines += ["", "Warnings before that:"] + ["  " + warning for warning in warnings]
+
+        lines += [
+            "",
+            "Link:       {}".format(self.url),
+            "Saving to:  {}".format(self.download_dir),
+            "Download:   {}".format(quality),
+            "Computer:   {}".format(platform.platform()),
+            "Program:    {}".format("ytdl.exe" if getattr(sys, "frozen", False) else "ytdl.py"),
+        ]
+        if not self.full_errors:
+            lines += ["", "(Tick \"Show full error details\" and try again for yt-dlp's full log.)"]
+        if self.log:
+            lines += ["", "--- everything yt-dlp printed ---"] + self.log
+        if crash:
+            lines += ["", "--- program error ---", crash.rstrip()]
+        return "\n".join(lines)
 
 
 # --- the window ---------------------------------------------------------------
@@ -818,7 +874,7 @@ class App:
         if kind == "cancelled":
             self.show_result("Download cancelled.")
         elif kind == "error":
-            messagebox.showerror("Error", payload)
+            ErrorDialog(self.root, payload["summary"], payload["details"], self.show_full_errors.get())
         else:
             name = os.path.basename(payload) if payload else "your file"
             self.show_result("Done in {}  -  saved {}".format(elapsed, name))
@@ -827,6 +883,76 @@ class App:
     def show_result(self, text):
         self.result_label.config(text=text)
         self.result_label.grid()
+
+
+class ErrorDialog:
+    """Says why a download failed, in a window whose text can be selected and
+    copied - unlike a message box - so it can be sent to whoever can help."""
+
+    def __init__(self, parent, summary, details, show_details):
+        self.summary, self.details = summary, details
+        family = pick_font_family(parent)
+        window = self.window = tk.Toplevel(parent, bg=COLORS["bg"])
+        window.title("Download failed")
+        window.transient(parent)
+        window.minsize(560, 0)
+
+        frame = ttk.Frame(window, style="App.TFrame", padding=20)
+        frame.pack(fill="both", expand=True)
+        frame.columnconfigure(0, weight=1)
+
+        ttk.Label(frame, text="Download failed", style="Title.TLabel",
+                  foreground=COLORS["accent"]).grid(row=0, column=0, sticky="w", pady=(0, 10))
+
+        summary_box = self.text_box(frame, summary, (family, 10), height=summary.count("\n") + 2)
+        summary_box.grid(row=1, column=0, sticky="we")
+
+        row = 2
+        if show_details:
+            frame.rowconfigure(3, weight=1)
+            ttk.Label(frame, text="Details", style="Subtitle.TLabel").grid(
+                row=2, column=0, sticky="w", pady=(14, 4))
+            holder = ttk.Frame(frame, style="App.TFrame")
+            holder.grid(row=3, column=0, sticky="nsew")
+            holder.columnconfigure(0, weight=1)
+            holder.rowconfigure(0, weight=1)
+            details_box = self.text_box(holder, details, ("Consolas", 9), height=16, wrap="char")
+            details_box.grid(row=0, column=0, sticky="nsew")
+            bar = ttk.Scrollbar(holder, orient="vertical", command=details_box.yview)
+            bar.grid(row=0, column=1, sticky="ns")
+            details_box.configure(yscrollcommand=bar.set)
+            row = 4
+
+        buttons = ttk.Frame(frame, style="App.TFrame")
+        buttons.grid(row=row, column=0, sticky="we", pady=(14, 0))
+        buttons.columnconfigure(0, weight=1)
+        self.copied = ttk.Label(buttons, style="Subtitle.TLabel")
+        self.copied.grid(row=0, column=0, sticky="w")
+        ttk.Button(buttons, text="Copy everything", style="Quiet.TButton",
+                   command=self.copy).grid(row=0, column=1, padx=(0, 8))
+        close = ttk.Button(buttons, text="Close", style="Accent.TButton", command=window.destroy)
+        close.grid(row=0, column=2)
+
+        window.bind("<Escape>", lambda event: window.destroy())
+        close.focus_set()
+        window.grab_set()
+
+    @staticmethod
+    def text_box(parent, text, font, height, wrap="word"):
+        """Read-only, but selectable and copyable with Ctrl+C"""
+        box = tk.Text(parent, font=font, height=height, wrap=wrap, relief="flat",
+                      bg=COLORS["card"], fg=COLORS["text"], padx=12, pady=10,
+                      highlightthickness=1, highlightbackground=COLORS["border"],
+                      highlightcolor=COLORS["border"], selectbackground=COLORS["accent_soft"],
+                      selectforeground=COLORS["text"], inactiveselectbackground=COLORS["accent_soft"])
+        box.insert("1.0", text)
+        box.configure(state="disabled")
+        return box
+
+    def copy(self):
+        self.window.clipboard_clear()
+        self.window.clipboard_append("{}\n\n{}".format(self.summary, self.details))
+        self.copied.config(text="Copied - paste it into an email or message")
 
 
 def show_in_folder(path, folder):
