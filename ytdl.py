@@ -101,8 +101,9 @@ def is_emptied(request):
 def diagnose(url, log_dir):
     """Re-run the extraction with traffic logging and report what got rejected.
 
-    Returns (summary_text, log_path). --simulate means nothing is downloaded; we
-    only need to get far enough to hit the request that failed."""
+    Returns (summary_text, log_path, blocked), where blocked lists each blocked
+    address as a dict of address / purpose / outcome. --simulate means nothing is
+    downloaded; we only need to get far enough to hit the request that failed."""
     cmd = [
         get_yt_dlp_path(),
         "--no-check-certificate",
@@ -118,11 +119,13 @@ def diagnose(url, log_dir):
             creationflags=NO_WINDOW,
         )
     except Exception as error:
-        return "Could not run the connection check: {}".format(error), None
+        return "Could not run the connection check: {}".format(error), None, []
 
     output = (result.stdout or "") + (result.stderr or "")
     requests = parse_traffic(output)
-    rejected = [r for r in requests if r[2] >= 400]
+    # 404 and 429 come from YouTube itself (no such address / too many requests),
+    # not from a filter, so they aren't reported as blocked. They stay in the log.
+    rejected = [r for r in requests if r[2] >= 400 and r[2] not in (404, 429)]
     emptied = [r for r in requests if is_emptied(r)]
 
     # Save the full log so it can be shown to whoever runs the filter.
@@ -142,25 +145,28 @@ def diagnose(url, log_dir):
         log_path = None
 
     if not requests:
-        return "The connection check produced no traffic to inspect.", log_path
+        return "The connection check produced no traffic to inspect.", log_path, []
 
     if not rejected and not emptied:
         return (
             "The connection check completed {} request(s) and none were rejected, "
             "so the problem may be intermittent - try again.".format(len(requests))
-        ), log_path
+        ), log_path, []
 
-    lines = ["Blocked addresses - these need to be allowed for downloading to work:"]
-    seen = set()
+    blocked, seen = [], set()
     for request in [r for r in requests if r in rejected or r in emptied]:
         address = short_address(request[1])
-        if address in seen:
-            continue
-        seen.add(address)
-        lines += ["", "  " + address,
-                  "  What it is: " + describe_address(address),
-                  "  What happened: " + describe_outcome(request)]
-    return "\n".join(lines), log_path
+        if address not in seen:
+            seen.add(address)
+            blocked.append({"address": address, "purpose": describe_address(address),
+                            "outcome": describe_outcome(request)})
+
+    lines = ["Blocked addresses - these need to be allowed for downloading to work:"]
+    for item in blocked:
+        lines += ["", "  " + item["address"],
+                  "  What it is: " + item["purpose"],
+                  "  What happened: " + item["outcome"]]
+    return "\n".join(lines), log_path, blocked
 
 
 # What each YouTube address is for, in words someone can pass on to a filter
@@ -194,10 +200,13 @@ def describe_address(url):
     return "An address the program needed while looking up the video."
 
 
+EMPTIED_OUTCOME = "It answered, but sent back nothing (filters often do this instead of refusing)."
+
+
 def describe_outcome(request):
     status = request[2]
     if is_emptied(request):
-        return "It answered, but sent back nothing (filters often do this instead of refusing)."
+        return EMPTIED_OUTCOME
     if status in (401, 403, 418, 451):
         return "It was refused (code {}).".format(status)
     if status == 404:
@@ -484,6 +493,31 @@ def kill_process_tree(process):
 
 # --- the download, on a background thread ------------------------------------
 
+GENERAL_ADVICE = (
+    "Video download failed.\n\n"
+    "Is the url correct?\n"
+    "Is the video allowed by your filtering settings?\n\n"
+    "Still not working?\nTry downloading the latest version from tinyurl.com/youtubekosherdl\n\n"
+    "Still not working?\nlet whoever gave you this program know."
+)
+
+
+def filter_request(blocked, video_url):
+    """A message, ready to send to a filter provider, asking for the blocked
+    addresses to be allowed"""
+    lines = [
+        "Hello,",
+        "",
+        "I'm trying to download a YouTube video, but my filter is blocking some",
+        "addresses that YouTube downloads need. Could you please allow these:",
+        "",
+    ]
+    for item in blocked:
+        lines += [item["address"], "  " + item["purpose"], "  " + item["outcome"], ""]
+    lines += ["The video I was downloading: {}".format(video_url), "", "Thank you"]
+    return "\n".join(lines)
+
+
 class Download:
     """Runs one yt-dlp download off the main thread. Never touches tkinter: it
     puts messages on a queue that the window reads (see App.poll)."""
@@ -562,6 +596,7 @@ class Download:
                 self.messages.put(("error", {
                     "summary": summary,
                     "details": self._details([], [], crash=traceback.format_exc()),
+                    "secondary": summary, "blocked": [], "url": self.url,
                 }))
 
         finally:
@@ -572,42 +607,38 @@ class Download:
                     pass  # nothing worth bothering the user about
 
     def _failure_report(self):
-        """What to tell the user about a failed download: a plain summary, and
-        the details someone would need to work out why"""
+        """What to tell the user about a failed download: a plain summary, the
+        details someone would need to work out why, and - when a filter is in
+        the way - which addresses it blocked"""
         output = "\n".join(self.log)
         errors, warnings = explain_failure(output)
-        summary = (
-            "Video download failed.\n\n"
-            "Is the url correct?\n"
-            "Is the video allowed by your filtering settings?\n\n"
-            "Still not working?\nTry downloading the latest version from tinyurl.com/youtubekosherdl\n\n"
-            "Still not working?\nlet whoever gave you this program know."
-        )
+        summary = GENERAL_ADVICE
+
         # A rejected request means something in between us and YouTube said no.
         # Find out which address it was, so it can be reported or allowed.
-        diagnosis = log_path = None
+        blocked, log_path = [], None
         if looks_blocked("\n".join(errors) or output) or player_api_emptied(output):
             self.messages.put(("progress", {"kind": "checking"}))
-            diagnosis, log_path = diagnose(self.url, self.download_dir)
-
-        if player_api_emptied(output):
-            summary += (
-                "\n\nWhat went wrong:\n"
-                "Something between this computer and YouTube - most likely your "
-                "filter - let the video page through, but sent back an empty answer "
-                "when the program asked YouTube which video and audio streams the "
-                "video has. Without that answer there is nothing to download, at "
-                "any quality. Ask your filter provider to allow {}"
-            ).format("the addresses listed below." if diagnosis and PLAYER_API in diagnosis
-                     else ":\n\n  " + PLAYER_API)
-        if diagnosis:
+            diagnosis, log_path, blocked = diagnose(self.url, self.download_dir)
             summary += "\n\n" + diagnosis
-            if log_path:
-                summary += "\n\nFull details saved to:\n{}".format(log_path)
-        if errors:
-            summary += "\n\nWhat yt-dlp said:\n" + "\n".join(errors)
 
-        return {"summary": summary, "details": self._details(errors, warnings)}
+        # The download itself showed the player address coming back empty, even
+        # if the re-check happened not to catch it this time
+        if player_api_emptied(output) and PLAYER_API not in [b["address"] for b in blocked]:
+            blocked.insert(0, {"address": PLAYER_API, "purpose": describe_address(PLAYER_API),
+                               "outcome": EMPTIED_OUTCOME})
+
+        # Shown under the blocked-addresses panel, so it leaves out the list,
+        # and the panel's headline already says the download failed
+        secondary = GENERAL_ADVICE.split("\n\n", 1)[1]
+        for extra in (["Full details saved to:\n" + log_path] if log_path else []) + \
+                     (["What yt-dlp said:\n" + "\n".join(errors)] if errors else []):
+            summary += "\n\n" + extra
+            secondary += "\n\n" + extra
+
+        return {"summary": summary, "secondary": secondary,
+                "details": self._details(errors, warnings),
+                "blocked": blocked, "url": self.url}
 
     def _details(self, errors, warnings, crash=None):
         """A plain-text report that can be copied and sent to someone"""
@@ -655,6 +686,9 @@ COLORS = {
     "accent_pressed": "#991b1b",
     "accent_soft": "#fee2e2",
     "disabled": "#d1d5db",
+    "warn_bg": "#fffbeb",
+    "warn_border": "#f59e0b",
+    "warn_text": "#92400e",
     "fast": "#15803d",
     "slower": "#b45309",
     "slowest": "#b91c1c",
@@ -970,7 +1004,7 @@ class App:
         if kind == "cancelled":
             self.show_result("Download cancelled.")
         elif kind == "error":
-            ErrorDialog(self.root, payload["summary"], payload["details"], self.show_full_errors.get())
+            ErrorDialog(self.root, payload, self.show_full_errors.get())
         else:
             name = os.path.basename(payload) if payload else "your file"
             self.show_result("Done in {}  -  saved {}".format(elapsed, name))
@@ -983,72 +1017,164 @@ class App:
 
 class ErrorDialog:
     """Says why a download failed, in a window whose text can be selected and
-    copied - unlike a message box - so it can be sent to whoever can help."""
+    copied - unlike a message box - so it can be sent to whoever can help.
 
-    def __init__(self, parent, summary, details, show_details):
-        self.summary, self.details = summary, details
-        family = pick_font_family(parent)
+    A filter blocking YouTube is the most common failure, and the one a person
+    can actually get fixed, so it gets its own layout: what is going on in plain
+    words, the addresses to ask for, and a ready-made request to send."""
+
+    def __init__(self, parent, report, show_details):
+        self.report = report
+        self.family = family = pick_font_family(parent)
+        blocked = report["blocked"]
         window = self.window = tk.Toplevel(parent, bg=COLORS["bg"])
-        window.title("Download failed")
+        window.title("Your filter is blocking this download" if blocked else "Download failed")
         window.transient(parent)
-        window.minsize(560, 0)
+        window.minsize(600, 0)
 
         frame = ttk.Frame(window, style="App.TFrame", padding=20)
         frame.pack(fill="both", expand=True)
         frame.columnconfigure(0, weight=1)
+        self.boxes = []
+        row = 0
 
-        ttk.Label(frame, text="Download failed", style="Title.TLabel",
-                  foreground=COLORS["accent"]).grid(row=0, column=0, sticky="w", pady=(0, 10))
+        if blocked:
+            row = self.build_blocked(frame, blocked)
+            ttk.Label(frame, text="Other things to try", style="Subtitle.TLabel").grid(
+                row=row, column=0, sticky="w", pady=(16, 4))
+            row += 1
+        else:
+            ttk.Label(frame, text="Download failed", style="Title.TLabel",
+                      foreground=COLORS["accent"]).grid(row=row, column=0, sticky="w", pady=(0, 10))
+            row += 1
 
-        summary_box = self.text_box(frame, summary, (family, 10), height=summary.count("\n") + 2)
-        summary_box.grid(row=1, column=0, sticky="we")
+        summary_box = self.text_box(frame, report["secondary"] if blocked else report["summary"],
+                                    (family, 9 if blocked else 10))
+        summary_box.grid(row=row, column=0, sticky="we")
+        row += 1
 
-        row = 2
         if show_details:
-            frame.rowconfigure(3, weight=1)
             ttk.Label(frame, text="Details", style="Subtitle.TLabel").grid(
-                row=2, column=0, sticky="w", pady=(14, 4))
+                row=row, column=0, sticky="w", pady=(14, 4))
+            row += 1
+            frame.rowconfigure(row, weight=1)
             holder = ttk.Frame(frame, style="App.TFrame")
-            holder.grid(row=3, column=0, sticky="nsew")
+            holder.grid(row=row, column=0, sticky="nsew")
             holder.columnconfigure(0, weight=1)
             holder.rowconfigure(0, weight=1)
-            details_box = self.text_box(holder, details, ("Consolas", 9), height=16, wrap="char")
+            details_box = self.text_box(holder, report["details"], ("Consolas", 9),
+                                        wrap="char", fit=False, height=14)
             details_box.grid(row=0, column=0, sticky="nsew")
             bar = ttk.Scrollbar(holder, orient="vertical", command=details_box.yview)
             bar.grid(row=0, column=1, sticky="ns")
             details_box.configure(yscrollcommand=bar.set)
-            row = 4
+            row += 1
 
         buttons = ttk.Frame(frame, style="App.TFrame")
-        buttons.grid(row=row, column=0, sticky="we", pady=(14, 0))
+        buttons.grid(row=row, column=0, sticky="we", pady=(16, 0))
         buttons.columnconfigure(0, weight=1)
         self.copied = ttk.Label(buttons, style="Subtitle.TLabel")
         self.copied.grid(row=0, column=0, sticky="w")
-        ttk.Button(buttons, text="Copy everything", style="Quiet.TButton",
-                   command=self.copy).grid(row=0, column=1, padx=(0, 8))
-        close = ttk.Button(buttons, text="Close", style="Accent.TButton", command=window.destroy)
-        close.grid(row=0, column=2)
+        if blocked:
+            ttk.Button(buttons, text="Copy full report", style="Quiet.TButton",
+                       command=self.copy_report).grid(row=0, column=1, padx=(0, 8))
+            main = ttk.Button(buttons, text="Copy request for your filter provider",
+                              style="Accent.TButton", command=self.copy_request)
+            main.grid(row=0, column=2, padx=(0, 8))
+            close = ttk.Button(buttons, text="Close", style="Quiet.TButton", command=window.destroy)
+            close.grid(row=0, column=3, sticky="ns")
+        else:
+            ttk.Button(buttons, text="Copy everything", style="Quiet.TButton",
+                       command=self.copy_report).grid(row=0, column=1, padx=(0, 8))
+            main = close = ttk.Button(buttons, text="Close", style="Accent.TButton",
+                                      command=window.destroy)
+            close.grid(row=0, column=2)
 
         window.bind("<Escape>", lambda event: window.destroy())
-        close.focus_set()
+        main.focus_set()
+
+        # Size each text box to its wrapped content, now its width is known.
+        # Measured in pixels, since the address box mixes font sizes; a Text
+        # widget's height is in lines of its base font.
+        from tkinter import font
+        window.update_idletasks()
+        for box in self.boxes:
+            box.configure(height=200)
+            window.update_idletasks()
+            pixels = box.count("1.0", "end", "ypixels")
+            pixels = pixels[0] if isinstance(pixels, tuple) else (pixels or 0)
+            line = font.Font(font=box.cget("font")).metrics("linespace")
+            box.configure(height=max(1, -(-pixels // line)))
         window.grab_set()
 
-    @staticmethod
-    def text_box(parent, text, font, height, wrap="word"):
+    def build_blocked(self, frame, blocked):
+        """The filter-blocked panel. Returns the next free grid row."""
+        family, c = self.family, COLORS
+        panel = tk.Frame(frame, bg=c["warn_bg"], highlightthickness=1,
+                         highlightbackground=c["warn_border"])
+        panel.grid(row=0, column=0, sticky="we")
+        panel.columnconfigure(1, weight=1)
+        tk.Frame(panel, bg=c["warn_border"], width=6).grid(row=0, column=0, rowspan=3, sticky="ns")
+
+        tk.Label(panel, text="Your filter is blocking this download", bg=c["warn_bg"],
+                 fg=c["warn_text"], font=(family, 16, "bold"), anchor="w", justify="left"
+                 ).grid(row=0, column=1, sticky="we", padx=16, pady=(14, 6))
+        tk.Label(panel, bg=c["warn_bg"], fg=c["text"], font=(family, 10), anchor="w",
+                 justify="left", wraplength=540, text=(
+                     "The video is fine, and you didn't do anything wrong. Your internet "
+                     "filter is stopping this program from reaching parts of YouTube it "
+                     "needs, so nothing can be downloaded. Choosing a different quality "
+                     "won't help.\n\n"
+                     "To fix it, ask your filter provider to allow the addresses below. "
+                     "The red button copies a ready-made request you can paste into an "
+                     "email or their support form.")
+                 ).grid(row=1, column=1, sticky="we", padx=16, pady=(0, 12))
+
+        # The addresses, in a box whose text can be selected and copied
+        box = tk.Text(panel, font=(family, 10), wrap="word", relief="flat", width=60, height=4,
+                      bg=c["card"], fg=c["text"], padx=14, pady=10, highlightthickness=1,
+                      highlightbackground=c["warn_border"], highlightcolor=c["warn_border"],
+                      selectbackground=c["accent_soft"], selectforeground=c["text"],
+                      inactiveselectbackground=c["accent_soft"], cursor="xterm")
+        box.tag_configure("address", font=("Consolas", 11, "bold"), spacing1=6)
+        box.tag_configure("note", foreground=c["muted"], font=(family, 9), lmargin1=16, lmargin2=16)
+        for index, item in enumerate(blocked):
+            if index:
+                box.insert("end", "\n")
+            box.insert("end", item["address"] + "\n", "address")
+            box.insert("end", item["purpose"] + "\n" + item["outcome"] + "\n", "note")
+        box.delete("end-2c", "end-1c")  # no trailing blank line
+        box.configure(state="disabled")
+        box.grid(row=2, column=1, sticky="we", padx=16, pady=(0, 16))
+        self.boxes.append(box)
+        return 1
+
+    def text_box(self, parent, text, font, wrap="word", fit=True, height=4):
         """Read-only, but selectable and copyable with Ctrl+C"""
-        box = tk.Text(parent, font=font, height=height, wrap=wrap, relief="flat",
-                      bg=COLORS["card"], fg=COLORS["text"], padx=12, pady=10,
-                      highlightthickness=1, highlightbackground=COLORS["border"],
-                      highlightcolor=COLORS["border"], selectbackground=COLORS["accent_soft"],
-                      selectforeground=COLORS["text"], inactiveselectbackground=COLORS["accent_soft"])
+        c = COLORS
+        box = tk.Text(parent, font=font, height=height, width=60, wrap=wrap, relief="flat",
+                      bg=c["card"], fg=c["text"], padx=12, pady=10,
+                      highlightthickness=1, highlightbackground=c["border"],
+                      highlightcolor=c["border"], selectbackground=c["accent_soft"],
+                      selectforeground=c["text"], inactiveselectbackground=c["accent_soft"])
         box.insert("1.0", text)
         box.configure(state="disabled")
+        if fit:
+            self.boxes.append(box)
         return box
 
-    def copy(self):
+    def copy_text(self, text, note):
         self.window.clipboard_clear()
-        self.window.clipboard_append("{}\n\n{}".format(self.summary, self.details))
-        self.copied.config(text="Copied - paste it into an email or message")
+        self.window.clipboard_append(text)
+        self.copied.config(text=note)
+
+    def copy_request(self):
+        self.copy_text(filter_request(self.report["blocked"], self.report["url"]),
+                       "Copied - paste it into an email to your filter provider")
+
+    def copy_report(self):
+        self.copy_text("{}\n\n{}".format(self.report["summary"], self.report["details"]),
+                       "Copied - paste it into an email or message")
 
 
 def show_in_folder(path, folder):

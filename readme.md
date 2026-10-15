@@ -67,6 +67,10 @@ and the download ends with "Requested format is not available" at every quality.
 The app recognises this, says plainly that the player address needs allowing,
 and the connection check lists such empty replies alongside rejected ones.
 
+When a filter is the cause, the error window says so in plain words, lists each
+blocked address with what it is for, and has a button that copies a ready-made
+request to send to the filter provider.
+
 ## Features
 - Simple GUI interface for entering YouTube URLs
 - Download as video (MP4) or audio (MP3)
