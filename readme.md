@@ -5,8 +5,8 @@ Using yt-dlp, which is the most reliable and actively maintained YouTube downloa
 It handles all the complexity of YouTube's changing APIs.
 
 It's a game of cat and mouse - since youtube is trying to block bots.
-Releases are rebuilt automatically whenever yt-dlp puts out a new version, so the
-newest download on the releases page is always current.
+Releases are rebuilt automatically whenever the program changes or yt-dlp puts out
+a new version, so the newest download on the releases page is always current.
 
 In order to work, you'll need to bypass the .exe files from any content filter.
 
@@ -31,10 +31,18 @@ That downloads the tools and produces `dist\ytdl.exe`.
 
 ## How releases happen
 
-`.github/workflows/release.yml` runs once a day. It compares the yt-dlp version
-recorded in `versions.json` against yt-dlp's newest release. If they differ, it
-builds a fresh `ytdl.exe`, publishes it as a new release, and then records the
-version it shipped. If they match, it stops without doing anything.
+`.github/workflows/release.yml` publishes a new release in two cases:
+
+- **A change is merged into `main`** that touches the program itself (`ytdl.py`,
+  `build.ps1`, `requirements.txt` or `versions.json`). Readme and workflow edits
+  don't trigger a release.
+- **yt-dlp puts out a new version.** Once a day the workflow compares the yt-dlp
+  version recorded in `versions.json` against yt-dlp's newest release, and builds
+  if they differ.
+
+Either way it builds a fresh `ytdl.exe` against the newest yt-dlp, publishes it,
+and then records the version it shipped. On a day with no change it stops without
+doing anything.
 
 You can also run it by hand from the Actions tab. It defaults to a dry run, which
 builds the exe and attaches it to the workflow run without publishing a release.
