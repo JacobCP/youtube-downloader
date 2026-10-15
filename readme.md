@@ -47,52 +47,43 @@ doing anything.
 You can also run it by hand from the Actions tab. It defaults to a dry run, which
 builds the exe and attaches it to the workflow run without publishing a release.
 
-## When a content filter blocks it
+## Working with content filters
 
-If a download fails because something rejected a request, the app re-runs the
-extraction with traffic logging and tells you the exact addresses that were
-refused, along with their HTTP status. It also writes `ytdl-diagnostic.log` into
-your chosen download folder, with cookies stripped out so it is safe to pass on.
+This program is meant to work on computers with a content filter installed.
+When it doesn't, that's a shortcoming of the program, to be fixed here - users
+are never told to contact their filter company.
 
-This matters because a filter can allow the video itself while still refusing the
-address yt-dlp needs to fetch the stream details - typically
-`https://www.youtube.com/youtubei/v1/player`. The error on its own says only
-"Unable to download API page", which is not enough to ask for the address to be
-allowed.
+**Finding the streams another way.** yt-dlp normally finds a video's streams with
+a single request to YouTube's player API (`https://www.youtube.com/youtubei/v1/player`).
+Filters can answer that request with nothing, and the download then fails with
+"Requested format is not available" at every quality. When the streams can't be
+found, the app tries again, in turn:
 
-Some filters don't refuse that address outright - they answer it with an empty
-reply. yt-dlp then reports "Failed to parse JSON", falls back to the streams
-listed in the web page (which YouTube now limits to a format yt-dlp can't save),
-and the download ends with "Requested format is not available" at every quality.
-The app recognises this, says plainly that the player address needs allowing,
-and the connection check lists such empty replies alongside rejected ones.
+1. reading the stream list straight from the video's web page, loaded as Safari
+   (`player_client=web_safari;webpage_client=web_safari`) - no player API request
+   at all, and Safari's HLS streams need no extra security token;
+2. asking the player API as YouTube's TV app (`player_client=tv,tv_downgraded`).
 
-When a filter is the cause, the error window says so in plain words, lists each
-blocked address with what it is for, and has a button that copies a ready-made
-request to send to the filter provider.
+**When nothing gets through,** the error window explains it in plain words and
+its main button copies a report for whoever gave the user the program. How firmly
+it blames the filter depends on the evidence:
 
-YouTube sometimes answers the request for a video's streams with nothing at all,
-and the same video can fail and then work. When that happens the app retries
-straight away, asking as YouTube's TV app instead (`player_client=tv,tv_downgraded,visionos`).
-
-How firmly the error window blames the filter depends on the evidence:
-
-- **"Your filter is blocking this download"** - code 418 (filters use it, YouTube
-  never does) or code 451.
-- **"Your filter may be blocking this download"** - code 403, which filters send
-  but so does YouTube itself, or an empty reply from the player address that
-  didn't come from Google's servers. It suggests trying again first.
-- **"YouTube's answer came back empty"** - the player address came back empty,
-  with no firm evidence of who emptied it. YouTube and a filter look the same
-  here, so it doesn't take sides; it suggests trying without the filter (e.g. a
-  phone hotspot) to tell which.
+- **"The filter on this computer blocked this download"** - code 418 (filters use
+  it, YouTube never does) or code 451.
+- **"Parts of YouTube refused this download"** - code 403, which filters send but so
+  does YouTube, or an empty reply that didn't come from Google's servers.
+- **"The program couldn't find this video's streams"** - every way of finding the
+  streams came back empty, with no firm evidence of who emptied them.
 - **"The connection to YouTube was cut"** - a reset, dropped or failed connection.
-  A filter can do that, but so can a bad internet connection.
 
 Other error codes (400, 404, 429, 5xx) are YouTube's own answers and are never
-blamed on the filter. Blocks on the video servers (`*.googlevideo.com`) are
-recognised from the download's own error, since the connection check never
-downloads the video itself.
+blamed on the filter. Blocks on the video servers (`*.googlevideo.com`) are read
+from the download's own error.
+
+To see exactly what was refused, the app re-runs the lookup with traffic logging
+and writes `ytdl-diagnostic.log` into the download folder (cookies removed). It
+lists every request with its status, marks empty replies, and records which
+server sent each one.
 
 ## Features
 - Simple GUI interface for entering YouTube URLs

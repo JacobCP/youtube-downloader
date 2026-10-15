@@ -186,7 +186,7 @@ def diagnose(url, log_dir):
             seen.add(address)
             blocked.append(blocked_item(address, request))
 
-    lines = ["Blocked addresses - these need to be allowed for downloading to work:"]
+    lines = ["Blocked addresses:"]
     for item in blocked:
         lines += ["", "  " + item["address"],
                   "  What it is: " + item["purpose"],
@@ -353,16 +353,25 @@ POSTPROCESSOR_STAGES = {
 }
 
 
-# yt-dlp's default way of asking YouTube for a video's streams is a single
-# request as the "visionos" app (its other default, "web", now only gets streams
-# yt-dlp can't save). When YouTube answers that one request with nothing, the
-# download fails - so the retry asks as YouTube's TV apps instead, which also
-# need no extra security token.
-RETRY_PLAYER_CLIENTS = "tv,tv_downgraded,visionos"
+# yt-dlp's default way of finding a video's streams is a single request to
+# YouTube's player API (https://www.youtube.com/youtubei/v1/player) as the
+# "visionos" app; its other default, "web", now only gets streams yt-dlp can't
+# save. Filters installed on the computer can empty that one request, and the
+# download fails. This program has to work with those filters, so when the
+# streams can't be found it tries these other ways in turn:
+RETRY_STRATEGIES = (
+    # Read the stream list straight out of the video's web page, loaded as
+    # Safari. The page gets through filters that interfere with the player API,
+    # and this makes no player API request at all. Safari is offered HLS
+    # streams, which need no extra security token from YouTube.
+    ("as the Safari web page", "youtube:player_client=web_safari;webpage_client=web_safari"),
+    # Ask the player API as YouTube's TV apps, which also need no token.
+    ("as YouTube's TV app", "youtube:player_client=tv,tv_downgraded"),
+)
 
 
 def build_command(url, download_dir, media_type, quality, path_file, verbose=False,
-                  player_clients=None):
+                  extractor_args=None):
     """Build the yt-dlp command line for a download"""
     cmd = [
         get_yt_dlp_path(),
@@ -400,8 +409,8 @@ def build_command(url, download_dir, media_type, quality, path_file, verbose=Fal
             "--merge-output-format", "mp4/mkv",
         ])
 
-    if player_clients:
-        cmd.extend(["--extractor-args", "youtube:player_client=" + player_clients])
+    if extractor_args:
+        cmd.extend(["--extractor-args", extractor_args])
 
     if verbose:
         # Versions, the exact options in effect and each step yt-dlp takes - the
@@ -486,6 +495,14 @@ def looks_blocked(error_text):
                "unable to download api page", "failed to resolve", "connection",
                "failed to parse json")
     return any(signal in text for signal in signals)
+
+
+def streams_not_found(output):
+    """yt-dlp couldn't find any streams it can download - the failure a
+    different way of asking might get past"""
+    return (player_api_emptied(output)
+            or "Requested format is not available" in output
+            or "Only images are available" in output)
 
 
 def player_api_emptied(output):
@@ -604,22 +621,6 @@ GENERAL_ADVICE = (
 )
 
 
-def filter_request(blocked, video_url):
-    """A message, ready to send to a filter provider, asking for the blocked
-    addresses to be allowed"""
-    lines = [
-        "Hello,",
-        "",
-        "I'm trying to download a YouTube video, but my filter is blocking some",
-        "addresses that YouTube downloads need. Could you please allow these:",
-        "",
-    ]
-    for item in blocked:
-        lines += [item["address"], "  " + item["purpose"], "  " + item["outcome"], ""]
-    lines += ["The video I was downloading: {}".format(video_url), "", "Thank you"]
-    return "\n".join(lines)
-
-
 class Download:
     """Runs one yt-dlp download off the main thread. Never touches tkinter: it
     puts messages on a queue that the window reads (see App.poll)."""
@@ -635,6 +636,7 @@ class Download:
         self.cancelled = False
         self.started_at = time.time()
         self.log = []  # everything yt-dlp printed, apart from progress lines
+        self.tried = ["the usual way"]  # each way of finding the streams, in order
 
     def start(self):
         threading.Thread(target=self._run, daemon=True).start()
@@ -653,15 +655,20 @@ class Download:
             handle, path_file = tempfile.mkstemp(prefix="ytdl-path-", suffix=".txt")
             os.close(handle)
 
+            first_line = len(self.log)
             self._attempt(path_file)
-            # YouTube sometimes answers the stream lookup with nothing. Retry
-            # straight away, asking a different way, before giving up.
-            if (self.process.returncode != 0 and not self.cancelled
-                    and player_api_emptied("\n".join(self.log))):
-                self.messages.put(("progress", {"kind": "retrying"}))
-                self.log.append("--- YouTube sent an empty answer; trying again as its TV app "
-                                "(player_client={}) ---".format(RETRY_PLAYER_CLIENTS))
-                self._attempt(path_file, player_clients=RETRY_PLAYER_CLIENTS)
+            # When the streams couldn't be found, try the other ways in turn
+            for number, (how, extractor_args) in enumerate(RETRY_STRATEGIES, start=2):
+                if (self.process.returncode == 0 or self.cancelled
+                        or not streams_not_found("\n".join(self.log[first_line:]))):
+                    break
+                self.messages.put(("progress", {"kind": "retrying", "number": number,
+                                                "total": len(RETRY_STRATEGIES) + 1}))
+                self.log.append("--- streams not found; trying again {} (--extractor-args {}) ---"
+                                .format(how, extractor_args))
+                self.tried.append(how)
+                first_line = len(self.log)
+                self._attempt(path_file, extractor_args=extractor_args)
 
             if self.cancelled:
                 remove_leftovers(self.download_dir, self.started_at)
@@ -701,11 +708,11 @@ class Download:
                 except OSError:
                     pass  # nothing worth bothering the user about
 
-    def _attempt(self, path_file, player_clients=None):
+    def _attempt(self, path_file, extractor_args=None):
         """Run yt-dlp once, passing its progress on and keeping everything else
         it prints in self.log"""
         cmd = build_command(self.url, self.download_dir, self.media_type, self.quality,
-                            path_file, verbose=self.full_errors, player_clients=player_clients)
+                            path_file, verbose=self.full_errors, extractor_args=extractor_args)
         self.process = subprocess.Popen(
             cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
             stdin=subprocess.DEVNULL, text=True, errors="replace",
@@ -790,6 +797,7 @@ class Download:
             "Link:       {}".format(self.url),
             "Saving to:  {}".format(self.download_dir),
             "Download:   {}".format(quality),
+            "Tried:      {}".format(", then ".join(self.tried)),
             "Computer:   {}".format(platform.platform()),
             "Program:    {}".format("ytdl.exe" if getattr(sys, "frozen", False) else "ytdl.py"),
         ]
@@ -1107,7 +1115,8 @@ class App:
         if update["kind"] == "checking":
             self.show_stage("Checking which addresses are blocked...", indeterminate=True)
         elif update["kind"] == "retrying":
-            self.show_stage("The answer came back empty - trying another way...",
+            self.show_stage("Couldn't find the video's streams - trying another way "
+                            "({} of {})...".format(update["number"], update["total"]),
                             indeterminate=True)
         elif update["kind"] == "post":
             stage = POSTPROCESSOR_STAGES.get(update["name"])
@@ -1164,7 +1173,6 @@ class ErrorDialog:
         self.report = report
         self.family = family = pick_font_family(parent)
         verdict = report.get("verdict")
-        asks_filter = verdict in ("blocked", "maybe_blocked")
         window = self.window = tk.Toplevel(parent, bg=COLORS["bg"])
         window.title(PANELS[verdict]["title"] if verdict else "Download failed")
         window.transient(parent)
@@ -1213,16 +1221,8 @@ class ErrorDialog:
         buttons.columnconfigure(0, weight=1)
         self.copied = ttk.Label(buttons, style="Subtitle.TLabel")
         self.copied.grid(row=0, column=0, sticky="w")
-        if asks_filter:
-            ttk.Button(buttons, text="Copy full report", style="Quiet.TButton",
-                       command=self.copy_report).grid(row=0, column=1, padx=(0, 8))
-            main = ttk.Button(buttons, text="Copy request for your filter provider",
-                              style="Accent.TButton", command=self.copy_request)
-            main.grid(row=0, column=2, padx=(0, 8))
-            close = ttk.Button(buttons, text="Close", style="Quiet.TButton", command=window.destroy)
-            close.grid(row=0, column=3, sticky="ns")
-        elif verdict:
-            main = ttk.Button(buttons, text="Copy full report", style="Accent.TButton",
+        if verdict:
+            main = ttk.Button(buttons, text="Copy report to send", style="Accent.TButton",
                               command=self.copy_report)
             main.grid(row=0, column=1, padx=(0, 8))
             close = ttk.Button(buttons, text="Close", style="Quiet.TButton", command=window.destroy)
@@ -1259,7 +1259,7 @@ class ErrorDialog:
         panel = tk.Frame(frame, bg=bg, highlightthickness=1, highlightbackground=border)
         panel.grid(row=0, column=0, sticky="we")
         panel.columnconfigure(1, weight=1)
-        tk.Frame(panel, bg=border, width=6).grid(row=0, column=0, rowspan=3, sticky="ns")
+        tk.Frame(panel, bg=border, width=6).grid(row=0, column=0, rowspan=4, sticky="ns")
 
         tk.Label(panel, text=config["title"], bg=bg, fg=fg, font=(family, 16, "bold"),
                  anchor="w", justify="left").grid(row=0, column=1, sticky="we", padx=16, pady=(14, 6))
@@ -1269,6 +1269,9 @@ class ErrorDialog:
         if not blocked:
             return 1
 
+        tk.Label(panel, text=config.get("list_heading", ""), bg=bg, fg=fg,
+                 font=(family, 10, "bold"), anchor="w").grid(row=2, column=1, sticky="we",
+                                                             padx=16, pady=(0, 4))
         # The addresses, in a box whose text can be selected and copied
         box = tk.Text(panel, font=(family, 10), wrap="word", relief="flat", width=60, height=4,
                       bg=c["card"], fg=c["text"], padx=14, pady=10, highlightthickness=1,
@@ -1284,7 +1287,7 @@ class ErrorDialog:
             box.insert("end", item["purpose"] + "\n" + item["outcome"] + "\n", "note")
         box.delete("end-2c", "end-1c")  # no trailing blank line
         box.configure(state="disabled")
-        box.grid(row=2, column=1, sticky="we", padx=16, pady=(0, 16))
+        box.grid(row=3, column=1, sticky="we", padx=16, pady=(0, 16))
         self.boxes.append(box)
         return 1
 
@@ -1307,64 +1310,60 @@ class ErrorDialog:
         self.window.clipboard_append(text)
         self.copied.config(text=note)
 
-    def copy_request(self):
-        self.copy_text(filter_request(self.report["blocked"], self.report["url"]),
-                       "Copied - paste it into an email to your filter provider")
-
     def copy_report(self):
         self.copy_text("{}\n\n{}".format(self.report["summary"], self.report["details"]),
                        "Copied - paste it into an email or message")
 
 
-# The top panel of the error window, by how sure we are a filter is the cause
+# The top panel of the error window, by how sure we are a filter is the cause.
+# The program is meant to work with filters installed on the computer, so when
+# it doesn't, that's for whoever looks after the program to fix - never the
+# user, and never the filter company.
+_SEND_REPORT = ("please let whoever gave you this program know - the red button "
+                "copies a report you can paste into an email or message to them. "
+                "It tells them what went wrong, so they can make the program work "
+                "with your filter.")
+
 PANELS = {
     "blocked": {
         "tone": "warn",
-        "title": "Your filter is blocking this download",
+        "title": "The filter on this computer blocked this download",
         "text": (
-            "The video is fine, and you didn't do anything wrong. Your internet "
-            "filter is stopping this program from reaching parts of YouTube it "
-            "needs, so nothing can be downloaded. Choosing a different quality "
-            "won't help.\n\n"
-            "To fix it, ask your filter provider to allow the addresses below. "
-            "The red button copies a ready-made request you can paste into an "
-            "email or their support form."),
+            "The video is fine, and you didn't do anything wrong. The filter on "
+            "this computer stopped the program from reaching parts of YouTube it "
+            "needs, so it couldn't download this video. Choosing a different "
+            "quality won't help.\n\nTo get it fixed, " + _SEND_REPORT),
+        "list_heading": "What was blocked:",
     },
     "maybe_blocked": {
         "tone": "info",
-        "title": "Your filter may be blocking this download",
+        "title": "Parts of YouTube refused this download",
         "text": (
-            "Parts of YouTube refused this program. That is often a filter, but "
-            "YouTube sometimes refuses on its own too, so first try again in a "
-            "few minutes.\n\n"
-            "If it keeps happening, ask your filter provider to allow the "
-            "addresses below. The red button copies a ready-made request you can "
-            "paste into an email or their support form."),
+            "Parts of YouTube refused the program. That may be the filter on this "
+            "computer, or YouTube itself - it sometimes refuses for a while - so "
+            "first try again in a few minutes.\n\nIf it keeps happening, "
+            + _SEND_REPORT),
+        "list_heading": "What was refused:",
     },
     "empty_answer": {
         "tone": "info",
-        "title": "YouTube's answer came back empty",
+        "title": "The program couldn't find this video's streams",
         "text": (
             "When the program asked YouTube about this video, the answer came back "
-            "empty - and again when it tried a second way. That can be YouTube "
-            "having trouble, or your filter getting in the way. From here the two "
-            "look the same.\n\n"
-            "To tell which: if you can, connect to the internet without the filter "
-            "(for example through a phone hotspot) and try the same video. If it "
-            "works there, it's the filter - send them the full report (the red "
-            "button copies it). If it fails there too, it's YouTube: wait a while, "
-            "or get the latest version of this program from "
-            "tinyurl.com/youtubekosherdl."),
+            "empty. It tried other ways, and none of them worked either. That can "
+            "be YouTube having trouble, or the filter on this computer getting in "
+            "the way - from here the two look the same.\n\n"
+            "Try again in a little while. If it keeps happening, " + _SEND_REPORT),
     },
     "connection_cut": {
         "tone": "info",
         "title": "The connection to YouTube was cut",
         "text": (
-            "Something stopped the connection part-way. Often that's a filter, "
-            "but an unreliable internet connection looks the same from here.\n\n"
+            "Something stopped the connection part-way - the filter on this "
+            "computer, or an unreliable internet connection. From here the two "
+            "look the same.\n\n"
             "Check that your internet is working, then try again. If it keeps "
-            "happening, it's probably your filter: send them the full report - "
-            "the red button copies it."),
+            "happening, " + _SEND_REPORT),
     },
 }
 
