@@ -55,4 +55,23 @@ allowed.
 ## Features
 - Simple GUI interface for entering YouTube URLs
 - Download as video (MP4) or audio (MP3)
+- Choice of video quality - Quick (360p), HD (1080p) or Best (up to 4K) - with
+  what each one costs in download time shown next to it
+- Live progress while downloading: percentage, size, speed, time left and time
+  elapsed, plus a Cancel button that also tidies up the partial files
 - File highlighting in Windows Explorer after download
+
+## A note on quality
+YouTube serves only one file with picture and sound already together, at 360p.
+Anything sharper arrives as a separate video stream and audio stream that the
+bundled ffmpeg joins afterwards. So higher quality costs twice: a much bigger
+download (1080p is typically about 5x the size of 360p, 4K 20x or more), then a
+merge step. That's why Quick exists, and why the app says how slow each choice is.
+
+## File names
+Windows doesn't allow `\ / : * ? " < > |` in file names, and YouTube titles are
+full of them. The app swaps them for plain characters ("Part 1: Intro" is saved
+as "Part 1 - Intro"). It used to be the case that titles with these characters -
+or any characters outside the Windows console's code page, such as emoji - often
+ended with the folder opening instead of the file being highlighted. The path of
+the finished file is now read back as UTF-8, so that no longer happens.
