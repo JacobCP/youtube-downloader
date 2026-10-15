@@ -40,6 +40,12 @@ def get_yt_dlp_path():
 _SEND_RE = re.compile(r"^send: b['\"](.*)['\"]\s*$")
 _REPLY_RE = re.compile(r"^reply: ['\"]HTTP/[\d.]+ (\d{3})")
 _LENGTH_RE = re.compile(r"^header: Content-Length: (\d+)", re.IGNORECASE)
+_SERVER_RE = re.compile(r"^header: Server: (.*)$", re.IGNORECASE)
+
+# How Google's own servers label their replies. An empty reply carrying one of
+# these came from YouTube, not from a filter in between.
+_GOOGLE_SERVER_RE = re.compile(
+    r"^(esf|gws|gse|sffe|gvs|google|scaffolding|http server \(unknown\))", re.IGNORECASE)
 
 # YouTube's API, which answers "what streams does this video have?". A filter that
 # lets the video page through but not this leaves nothing to download.
@@ -51,7 +57,8 @@ _SECRET_HEADER_RE = re.compile(r"(?i)\\r\\n(cookie|authorization|x-goog-[a-z-]*a
 
 def parse_traffic(text):
     """Turn yt-dlp --print-traffic output into a list of
-    (method, url, status, content_length) - content_length is None if not sent.
+    (method, url, status, content_length, server) - the last two are None if the
+    reply didn't include them.
 
     The log is http.client's debug output: a 'send:' line holding the raw request,
     followed by a 'reply:' line holding the status, then 'header:' lines. CONNECT
@@ -78,15 +85,18 @@ def parse_traffic(text):
         match = _REPLY_RE.match(line)
         if match and pending:
             last = len(requests)
-            requests.append((pending[0], pending[1], int(match.group(1)), None))
+            requests.append((pending[0], pending[1], int(match.group(1)), None, None))
             pending = None
             continue
 
-        match = _LENGTH_RE.match(line)
-        if match and last is not None:
-            method, address, status, _ = requests[last]
-            requests[last] = (method, address, status, int(match.group(1)))
-            last = None
+        if last is not None:
+            method, address, status, length, server = requests[last]
+            match = _LENGTH_RE.match(line)
+            if match:
+                requests[last] = (method, address, status, int(match.group(1)), server)
+            match = _SERVER_RE.match(line)
+            if match:
+                requests[last] = (method, address, status, length, match.group(1).strip())
 
     return requests
 
@@ -94,8 +104,13 @@ def parse_traffic(text):
 def is_emptied(request):
     """A 'successful' reply from YouTube's API with nothing in it - what a filter
     sends when it quietly swallows a request instead of refusing it"""
-    method, address, status, length = request
+    method, address, status, length, server = request
     return 200 <= status < 300 and length == 0 and "/youtubei/" in address
+
+
+def from_google(request):
+    """Did this reply come from Google's own servers, going by its label?"""
+    return bool(request[4] and _GOOGLE_SERVER_RE.match(request[4]))
 
 
 def diagnose(url, log_dir):
@@ -126,7 +141,10 @@ def diagnose(url, log_dir):
     # Only codes a filter uses count. Others (400, 404, 429, 5xx...) are YouTube's
     # own answers, so they aren't reported as blocked - they stay in the log.
     rejected = [r for r in requests if filter_certainty(r[2])]
-    emptied = [r for r in requests if is_emptied(r)]
+    # An empty reply labelled as coming from Google is YouTube's own hiccup;
+    # only one without that label can be the filter's doing
+    emptied = [r for r in requests if is_emptied(r) and not from_google(r)]
+    youtube_emptied = [r for r in requests if is_emptied(r) and from_google(r)]
 
     # Save the full log so it can be shown to whoever runs the filter.
     log_path = None
@@ -136,9 +154,10 @@ def diagnose(url, log_dir):
             handle.write("Diagnostic for: {}\n\n".format(url))
             handle.write("Requests made ({} total):\n".format(len(requests)))
             for request in requests:
-                method, address, status, length = request
+                method, address, status, length, server = request
                 note = "  (empty reply)" if is_emptied(request) else ""
-                handle.write("  {}  {:6} {}{}\n".format(status, method, address, note))
+                label = "  [server: {}]".format(server) if server else ""
+                handle.write("  {}  {:6} {}{}{}\n".format(status, method, address, note, label))
             handle.write("\n--- full traffic log (cookies removed) ---\n")
             handle.write(_SECRET_HEADER_RE.sub(r"\\r\\n\1: [removed]", output))
     except Exception:
@@ -146,6 +165,12 @@ def diagnose(url, log_dir):
 
     if not requests:
         return "The connection check produced no traffic to inspect.", log_path, []
+
+    if youtube_emptied and not rejected and not emptied:
+        return (
+            "The connection check got an empty reply again, but it came from "
+            "YouTube's own servers - so this is YouTube, not a filter."
+        ), log_path, []
 
     if not rejected and not emptied:
         return (
@@ -199,10 +224,8 @@ def describe_address(url):
     return "An address the program needed while looking up the video."
 
 
-EMPTIED_OUTCOME = "It answered, but sent back nothing (filters often do this instead of refusing)."
-# The download saw the player reply unreadable: empty, or a page put in its place
-REPLACED_OUTCOME = ("It answered, but not with YouTube's reply - it came back empty or "
-                    "replaced (filters often do this instead of refusing).")
+EMPTIED_OUTCOME = ("It answered, but sent back nothing - and not from YouTube's own "
+                   "servers, so possibly your filter.")
 
 
 # How sure an error code is to have come from a filter rather than YouTube.
@@ -238,7 +261,7 @@ def describe_outcome(request):
 def blocked_item(address, request):
     return {"address": address, "purpose": describe_address(address),
             "outcome": describe_outcome(request),
-            "certainty": "definite" if is_emptied(request) else filter_certainty(request[2])}
+            "certainty": "possible" if is_emptied(request) else filter_certainty(request[2])}
 
 
 # --- what to download ---------------------------------------------------------
@@ -329,7 +352,16 @@ POSTPROCESSOR_STAGES = {
 }
 
 
-def build_command(url, download_dir, media_type, quality, path_file, verbose=False):
+# yt-dlp's default way of asking YouTube for a video's streams is a single
+# request as the "visionos" app (its other default, "web", now only gets streams
+# yt-dlp can't save). When YouTube answers that one request with nothing, the
+# download fails - so the retry asks as YouTube's TV apps instead, which also
+# need no extra security token.
+RETRY_PLAYER_CLIENTS = "tv,tv_downgraded,visionos"
+
+
+def build_command(url, download_dir, media_type, quality, path_file, verbose=False,
+                  player_clients=None):
     """Build the yt-dlp command line for a download"""
     cmd = [
         get_yt_dlp_path(),
@@ -366,6 +398,9 @@ def build_command(url, download_dir, media_type, quality, path_file, verbose=Fal
             "--format-sort", FORMAT_SORT,
             "--merge-output-format", "mp4/mkv",
         ])
+
+    if player_clients:
+        cmd.extend(["--extractor-args", "youtube:player_client=" + player_clients])
 
     if verbose:
         # Versions, the exact options in effect and each step yt-dlp takes - the
@@ -457,7 +492,10 @@ def player_api_emptied(output):
     reply - not an error code, just nothing. Without that answer yt-dlp only has
     what's in the web page, which YouTube now limits to a streaming format
     yt-dlp can't save, so every quality fails with "Requested format is not
-    available"."""
+    available".
+
+    This is usually YouTube itself: the same video can fail and then work a
+    minute later, which an address-blocking filter would never do."""
     return "player API JSON" in output and "Failed to parse JSON" in output
 
 
@@ -614,22 +652,15 @@ class Download:
             handle, path_file = tempfile.mkstemp(prefix="ytdl-path-", suffix=".txt")
             os.close(handle)
 
-            cmd = build_command(self.url, self.download_dir, self.media_type,
-                                self.quality, path_file, verbose=self.full_errors)
-            self.process = subprocess.Popen(
-                cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-                stdin=subprocess.DEVNULL, text=True, errors="replace",
-                creationflags=NO_WINDOW,
-            )
-
-            for line in self.process.stdout:
-                line = line.rstrip()
-                update = parse_progress(line)
-                if update:
-                    self.messages.put(("progress", update))
-                elif line:
-                    self.log.append(line)
-            self.process.wait()
+            self._attempt(path_file)
+            # YouTube sometimes answers the stream lookup with nothing. Retry
+            # straight away, asking a different way, before giving up.
+            if (self.process.returncode != 0 and not self.cancelled
+                    and player_api_emptied("\n".join(self.log))):
+                self.messages.put(("progress", {"kind": "retrying"}))
+                self.log.append("--- YouTube sent an empty answer; trying again as its TV app "
+                                "(player_client={}) ---".format(RETRY_PLAYER_CLIENTS))
+                self._attempt(path_file, player_clients=RETRY_PLAYER_CLIENTS)
 
             if self.cancelled:
                 remove_leftovers(self.download_dir, self.started_at)
@@ -669,6 +700,25 @@ class Download:
                 except OSError:
                     pass  # nothing worth bothering the user about
 
+    def _attempt(self, path_file, player_clients=None):
+        """Run yt-dlp once, passing its progress on and keeping everything else
+        it prints in self.log"""
+        cmd = build_command(self.url, self.download_dir, self.media_type, self.quality,
+                            path_file, verbose=self.full_errors, player_clients=player_clients)
+        self.process = subprocess.Popen(
+            cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+            stdin=subprocess.DEVNULL, text=True, errors="replace",
+            creationflags=NO_WINDOW,
+        )
+        for line in self.process.stdout:
+            line = line.rstrip()
+            update = parse_progress(line)
+            if update:
+                self.messages.put(("progress", update))
+            elif line:
+                self.log.append(line)
+        self.process.wait()
+
     def _failure_report(self):
         """What to tell the user about a failed download: a plain summary, the
         details someone would need to work out why, and - when a filter is in
@@ -688,18 +738,21 @@ class Download:
         # What the download itself showed counts too, since the re-check is a
         # second attempt that may not hit the same wall
         addresses = [b["address"] for b in blocked]
-        if player_api_emptied(output) and PLAYER_API not in addresses:
-            blocked.insert(0, {"address": PLAYER_API, "purpose": describe_address(PLAYER_API),
-                               "outcome": REPLACED_OUTCOME, "certainty": "definite"})
         stream_status = stream_block_status(output)
         stream_address = short_address("https://x.googlevideo.com/videoplayback")
         if stream_status and stream_address not in addresses:
-            blocked.append(blocked_item(stream_address, ("GET", stream_address, stream_status, None)))
+            blocked.append(blocked_item(stream_address,
+                                        ("GET", stream_address, stream_status, None, None)))
 
         if any(item["certainty"] == "definite" for item in blocked):
             verdict = "blocked"
         elif blocked:
             verdict = "maybe_blocked"
+        elif player_api_emptied(output):
+            # Empty stream lookups, even after retrying another way, with no
+            # sign of a filter - and a filter blocks an address every time,
+            # while these come and go
+            verdict = "youtube_glitch"
         elif connection_cut(errors):
             verdict = "connection_cut"
         else:
@@ -1053,6 +1106,9 @@ class App:
         self.detail = ""
         if update["kind"] == "checking":
             self.show_stage("Checking which addresses are blocked...", indeterminate=True)
+        elif update["kind"] == "retrying":
+            self.show_stage("YouTube didn't answer properly - trying another way...",
+                            indeterminate=True)
         elif update["kind"] == "post":
             stage = POSTPROCESSOR_STAGES.get(update["name"])
             if stage and update["status"] != "finished":
@@ -1284,6 +1340,18 @@ PANELS = {
             "If it keeps happening, ask your filter provider to allow the "
             "addresses below. The red button copies a ready-made request you can "
             "paste into an email or their support form."),
+    },
+    "youtube_glitch": {
+        "tone": "info",
+        "title": "YouTube didn't answer properly",
+        "text": (
+            "When the program asked YouTube about this video, YouTube sent back an "
+            "empty answer - and again when it tried a second way. That is almost "
+            "always on YouTube's side rather than your filter (a filter blocks "
+            "the same way every time), and the video is probably fine.\n\n"
+            "Wait a few minutes and try again. If it keeps happening, download "
+            "the latest version of this program from tinyurl.com/youtubekosherdl - "
+            "YouTube changes often, and newer versions keep up."),
     },
     "connection_cut": {
         "tone": "info",

@@ -71,12 +71,19 @@ When a filter is the cause, the error window says so in plain words, lists each
 blocked address with what it is for, and has a button that copies a ready-made
 request to send to the filter provider.
 
-How firmly it says so depends on the evidence:
+YouTube sometimes answers the request for a video's streams with nothing at all,
+and the same video can fail and then work. When that happens the app retries
+straight away, asking as YouTube's TV app instead (`player_client=tv,tv_downgraded,visionos`).
+
+How firmly the error window blames the filter depends on the evidence:
 
 - **"Your filter is blocking this download"** - code 418 (filters use it, YouTube
-  never does), code 451, or YouTube's player address coming back empty or replaced.
+  never does) or code 451.
 - **"Your filter may be blocking this download"** - code 403, which filters send
-  but so does YouTube itself. It suggests trying again first.
+  but so does YouTube itself, or an empty reply from the player address that
+  didn't come from Google's servers. It suggests trying again first.
+- **"YouTube didn't answer properly"** - the player address came back empty, but
+  the reply came from Google's own servers, or the re-check got a normal answer.
 - **"The connection to YouTube was cut"** - a reset, dropped or failed connection.
   A filter can do that, but so can a bad internet connection.
 
