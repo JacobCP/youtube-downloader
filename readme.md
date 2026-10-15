@@ -71,6 +71,20 @@ When a filter is the cause, the error window says so in plain words, lists each
 blocked address with what it is for, and has a button that copies a ready-made
 request to send to the filter provider.
 
+How firmly it says so depends on the evidence:
+
+- **"Your filter is blocking this download"** - code 418 (filters use it, YouTube
+  never does), code 451, or YouTube's player address coming back empty or replaced.
+- **"Your filter may be blocking this download"** - code 403, which filters send
+  but so does YouTube itself. It suggests trying again first.
+- **"The connection to YouTube was cut"** - a reset, dropped or failed connection.
+  A filter can do that, but so can a bad internet connection.
+
+Other error codes (400, 404, 429, 5xx) are YouTube's own answers and are never
+blamed on the filter. Blocks on the video servers (`*.googlevideo.com`) are
+recognised from the download's own error, since the connection check never
+downloads the video itself.
+
 ## Features
 - Simple GUI interface for entering YouTube URLs
 - Download as video (MP4) or audio (MP3)
