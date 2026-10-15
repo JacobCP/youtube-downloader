@@ -150,20 +150,63 @@ def diagnose(url, log_dir):
             "so the problem may be intermittent - try again.".format(len(requests))
         ), log_path
 
-    lines = []
-    if rejected:
-        lines += ["These addresses were rejected:", ""]
-        for method, address, status, _ in rejected:
-            lines.append("  HTTP {}  {} {}".format(status, method, address))
-        lines.append("")
-    if emptied:
-        lines += ["These addresses answered, but with nothing in the reply:", ""]
-        for method, address, status, _ in emptied:
-            lines.append("  HTTP {}  {} {}".format(status, method, address))
-        lines.append("")
-    lines.append("The video itself may well be permitted - it is these addresses")
-    lines.append("that need to be allowed for downloading to work.")
+    lines = ["Blocked addresses - these need to be allowed for downloading to work:"]
+    seen = set()
+    for request in [r for r in requests if r in rejected or r in emptied]:
+        address = short_address(request[1])
+        if address in seen:
+            continue
+        seen.add(address)
+        lines += ["", "  " + address,
+                  "  What it is: " + describe_address(address),
+                  "  What happened: " + describe_outcome(request)]
     return "\n".join(lines), log_path
+
+
+# What each YouTube address is for, in words someone can pass on to a filter
+# provider. Checked in order; the first match wins.
+_ADDRESS_PURPOSES = (
+    ("/youtubei/v1/player", "YouTube's list of the picture and sound streams a video has. "
+                            "Needed for every download."),
+    ("/youtubei/", "YouTube's internal API, which the program uses to look up the video."),
+    ("googlevideo.com", "Where the video and audio files themselves are downloaded from."),
+    ("/s/player/", "YouTube's player code, which is needed to unlock the streams."),
+    ("youtube.com/watch", "The video's own page."),
+    ("ytimg.com", "Thumbnail pictures. Not needed for downloading."),
+    ("accounts.google.com", "Google's sign-in service."),
+)
+
+
+def short_address(url):
+    """The address without its query string - the part a filter allows or blocks.
+    Stream addresses in particular carry hundreds of characters of parameters,
+    and come from many numbered servers, all of which need allowing."""
+    address = url.split("?", 1)[0]
+    if ".googlevideo.com/" in address:
+        return "https://*.googlevideo.com (every server under it)"
+    return address
+
+
+def describe_address(url):
+    for fragment, purpose in _ADDRESS_PURPOSES:
+        if fragment in url:
+            return purpose
+    return "An address the program needed while looking up the video."
+
+
+def describe_outcome(request):
+    status = request[2]
+    if is_emptied(request):
+        return "It answered, but sent back nothing (filters often do this instead of refusing)."
+    if status in (401, 403, 418, 451):
+        return "It was refused (code {}).".format(status)
+    if status == 404:
+        return "It said the address doesn't exist (code 404)."
+    if status == 429:
+        return "YouTube said too many requests were made - wait a while and try again (code 429)."
+    if status >= 500:
+        return "The server failed to answer (code {}).".format(status)
+    return "It was refused (code {}).".format(status)
 
 
 # --- what to download ---------------------------------------------------------
@@ -540,28 +583,29 @@ class Download:
             "Still not working?\nTry downloading the latest version from tinyurl.com/youtubekosherdl\n\n"
             "Still not working?\nlet whoever gave you this program know."
         )
+        # A rejected request means something in between us and YouTube said no.
+        # Find out which address it was, so it can be reported or allowed.
+        diagnosis = log_path = None
+        if looks_blocked("\n".join(errors) or output) or player_api_emptied(output):
+            self.messages.put(("progress", {"kind": "checking"}))
+            diagnosis, log_path = diagnose(self.url, self.download_dir)
+
         if player_api_emptied(output):
             summary += (
                 "\n\nWhat went wrong:\n"
                 "Something between this computer and YouTube - most likely your "
                 "filter - let the video page through, but sent back an empty answer "
                 "when the program asked YouTube which video and audio streams the "
-                "video has. That question goes to:\n\n"
-                "  {}\n\n"
-                "Without the answer there is nothing to download, at any quality. "
-                "Ask your filter provider to allow that address."
-            ).format(PLAYER_API)
-        if errors:
-            summary += "\n\nWhat yt-dlp said:\n" + "\n".join(errors)
-
-        # A rejected request means something in between us and YouTube said no.
-        # Find out which address it was, so it can be reported or allowed.
-        if looks_blocked("\n".join(errors) or output) or player_api_emptied(output):
-            self.messages.put(("progress", {"kind": "checking"}))
-            diagnosis, log_path = diagnose(self.url, self.download_dir)
+                "video has. Without that answer there is nothing to download, at "
+                "any quality. Ask your filter provider to allow {}"
+            ).format("the addresses listed below." if diagnosis and PLAYER_API in diagnosis
+                     else ":\n\n  " + PLAYER_API)
+        if diagnosis:
             summary += "\n\n" + diagnosis
             if log_path:
                 summary += "\n\nFull details saved to:\n{}".format(log_path)
+        if errors:
+            summary += "\n\nWhat yt-dlp said:\n" + "\n".join(errors)
 
         return {"summary": summary, "details": self._details(errors, warnings)}
 
