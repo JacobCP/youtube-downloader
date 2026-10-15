@@ -20,5 +20,5 @@
   "deno": "v2.9.5",
   "ffmpeg": "latest",
   "ffmpeg_variant": "win64-gpl",
-  "ffmpeg_last_built": ""
+  "ffmpeg_last_built": "N-127527-g045dea2a34-20261014"
 }
