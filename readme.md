@@ -60,6 +60,13 @@ address yt-dlp needs to fetch the stream details - typically
 "Unable to download API page", which is not enough to ask for the address to be
 allowed.
 
+Some filters don't refuse that address outright - they answer it with an empty
+reply. yt-dlp then reports "Failed to parse JSON", falls back to the streams
+listed in the web page (which YouTube now limits to a format yt-dlp can't save),
+and the download ends with "Requested format is not available" at every quality.
+The app recognises this, says plainly that the player address needs allowing,
+and the connection check lists such empty replies alongside rejected ones.
+
 ## Features
 - Simple GUI interface for entering YouTube URLs
 - Download as video (MP4) or audio (MP3)

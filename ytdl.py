@@ -39,18 +39,24 @@ def get_yt_dlp_path():
 
 _SEND_RE = re.compile(r"^send: b['\"](.*)['\"]\s*$")
 _REPLY_RE = re.compile(r"^reply: ['\"]HTTP/[\d.]+ (\d{3})")
+_LENGTH_RE = re.compile(r"^header: Content-Length: (\d+)", re.IGNORECASE)
+
+# YouTube's API, which answers "what streams does this video have?". A filter that
+# lets the video page through but not this leaves nothing to download.
+PLAYER_API = "https://www.youtube.com/youtubei/v1/player"
 
 # Headers worth keeping out of a log that gets handed to someone else.
 _SECRET_HEADER_RE = re.compile(r"(?i)\\r\\n(cookie|authorization|x-goog-[a-z-]*auth[a-z-]*):[^\\]*")
 
 
 def parse_traffic(text):
-    """Turn yt-dlp --print-traffic output into a list of (method, url, status).
+    """Turn yt-dlp --print-traffic output into a list of
+    (method, url, status, content_length) - content_length is None if not sent.
 
     The log is http.client's debug output: a 'send:' line holding the raw request,
-    followed by a 'reply:' line holding the status. CONNECT lines are the proxy
-    handshake rather than real requests, so they get skipped."""
-    requests, pending = [], None
+    followed by a 'reply:' line holding the status, then 'header:' lines. CONNECT
+    lines are the proxy handshake rather than real requests, so they get skipped."""
+    requests, pending, last = [], None, None
     for line in text.splitlines():
         line = line.strip()
 
@@ -71,10 +77,25 @@ def parse_traffic(text):
 
         match = _REPLY_RE.match(line)
         if match and pending:
-            requests.append((pending[0], pending[1], int(match.group(1))))
+            last = len(requests)
+            requests.append((pending[0], pending[1], int(match.group(1)), None))
             pending = None
+            continue
+
+        match = _LENGTH_RE.match(line)
+        if match and last is not None:
+            method, address, status, _ = requests[last]
+            requests[last] = (method, address, status, int(match.group(1)))
+            last = None
 
     return requests
+
+
+def is_emptied(request):
+    """A 'successful' reply from YouTube's API with nothing in it - what a filter
+    sends when it quietly swallows a request instead of refusing it"""
+    method, address, status, length = request
+    return 200 <= status < 300 and length == 0 and "/youtubei/" in address
 
 
 def diagnose(url, log_dir):
@@ -102,6 +123,7 @@ def diagnose(url, log_dir):
     output = (result.stdout or "") + (result.stderr or "")
     requests = parse_traffic(output)
     rejected = [r for r in requests if r[2] >= 400]
+    emptied = [r for r in requests if is_emptied(r)]
 
     # Save the full log so it can be shown to whoever runs the filter.
     log_path = None
@@ -110,8 +132,10 @@ def diagnose(url, log_dir):
         with open(log_path, "w", encoding="utf-8", errors="replace") as handle:
             handle.write("Diagnostic for: {}\n\n".format(url))
             handle.write("Requests made ({} total):\n".format(len(requests)))
-            for method, address, status in requests:
-                handle.write("  {}  {:6} {}\n".format(status, method, address))
+            for request in requests:
+                method, address, status, length = request
+                note = "  (empty reply)" if is_emptied(request) else ""
+                handle.write("  {}  {:6} {}{}\n".format(status, method, address, note))
             handle.write("\n--- full traffic log (cookies removed) ---\n")
             handle.write(_SECRET_HEADER_RE.sub(r"\\r\\n\1: [removed]", output))
     except Exception:
@@ -120,16 +144,23 @@ def diagnose(url, log_dir):
     if not requests:
         return "The connection check produced no traffic to inspect.", log_path
 
-    if not rejected:
+    if not rejected and not emptied:
         return (
             "The connection check completed {} request(s) and none were rejected, "
             "so the problem may be intermittent - try again.".format(len(requests))
         ), log_path
 
-    lines = ["These addresses were rejected:", ""]
-    for method, address, status in rejected:
-        lines.append("  HTTP {}  {} {}".format(status, method, address))
-    lines.append("")
+    lines = []
+    if rejected:
+        lines += ["These addresses were rejected:", ""]
+        for method, address, status, _ in rejected:
+            lines.append("  HTTP {}  {} {}".format(status, method, address))
+        lines.append("")
+    if emptied:
+        lines += ["These addresses answered, but with nothing in the reply:", ""]
+        for method, address, status, _ in emptied:
+            lines.append("  HTTP {}  {} {}".format(status, method, address))
+        lines.append("")
     lines.append("The video itself may well be permitted - it is these addresses")
     lines.append("that need to be allowed for downloading to work.")
     return "\n".join(lines), log_path
@@ -341,8 +372,18 @@ def looks_blocked(error_text):
     """Does this failure look like something refused a request, rather than a bad URL?"""
     text = (error_text or "").lower()
     signals = ("http error 4", "http error 5", "blocked", "forbidden",
-               "unable to download api page", "failed to resolve", "connection")
+               "unable to download api page", "failed to resolve", "connection",
+               "failed to parse json")
     return any(signal in text for signal in signals)
+
+
+def player_api_emptied(output):
+    """yt-dlp asked YouTube's API for the video's streams and got back an empty
+    reply - not an error code, just nothing. Without that answer yt-dlp only has
+    what's in the web page, which YouTube now limits to a streaming format
+    yt-dlp can't save, so every quality fails with "Requested format is not
+    available"."""
+    return "player API JSON" in output and "Failed to parse JSON" in output
 
 
 def find_downloaded_file(reported_path, download_dir, started_at):
@@ -499,12 +540,23 @@ class Download:
             "Still not working?\nTry downloading the latest version from tinyurl.com/youtubekosherdl\n\n"
             "Still not working?\nlet whoever gave you this program know."
         )
+        if player_api_emptied(output):
+            summary += (
+                "\n\nWhat went wrong:\n"
+                "Something between this computer and YouTube - most likely your "
+                "filter - let the video page through, but sent back an empty answer "
+                "when the program asked YouTube which video and audio streams the "
+                "video has. That question goes to:\n\n"
+                "  {}\n\n"
+                "Without the answer there is nothing to download, at any quality. "
+                "Ask your filter provider to allow that address."
+            ).format(PLAYER_API)
         if errors:
             summary += "\n\nWhat yt-dlp said:\n" + "\n".join(errors)
 
         # A rejected request means something in between us and YouTube said no.
         # Find out which address it was, so it can be reported or allowed.
-        if looks_blocked("\n".join(errors) or output):
+        if looks_blocked("\n".join(errors) or output) or player_api_emptied(output):
             self.messages.put(("progress", {"kind": "checking"}))
             diagnosis, log_path = diagnose(self.url, self.download_dir)
             summary += "\n\n" + diagnosis
