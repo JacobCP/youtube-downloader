@@ -1,9 +1,20 @@
 name: Build and release
 
-# Checks once a day whether yt-dlp has put out a new version. If it has, builds a
-# fresh ytdl.exe and publishes it as a release. If it hasn't, stops without doing
-# anything. Can also be run by hand from the Actions tab.
+# Publishes a fresh ytdl.exe as a release when either:
+#   - a change to the program is merged into main, or
+#   - the daily check finds yt-dlp has put out a new version.
+# Otherwise stops without doing anything. Can also be run by hand from the Actions tab.
 on:
+  push:
+    branches: [main]
+    # Only files that change what ends up in ytdl.exe. Readme and workflow edits
+    # don't cut a release. The bot's own versions.json commit doesn't either:
+    # pushes made with the workflow's token never start another workflow run.
+    paths:
+      - ytdl.py
+      - build.ps1
+      - requirements.txt
+      - versions.json
   schedule:
     - cron: "28 20 * * *"
   workflow_dispatch:
@@ -30,7 +41,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Has yt-dlp changed?
+      - name: Is a release needed?
         id: check
         shell: pwsh
         env:
@@ -44,11 +55,14 @@ jobs:
           Write-Host "last shipped: $shipped"
           Write-Host "yt-dlp latest: $latest"
 
-          $needed = ($latest -ne $shipped) -or ("${{ inputs.force }}" -eq "true")
+          $merged = "${{ github.event_name }}" -eq "push"
+          $needed = $merged -or ($latest -ne $shipped) -or ("${{ inputs.force }}" -eq "true")
           "latest=$latest" | Out-File $env:GITHUB_OUTPUT -Append
           "needed=$(if ($needed) { 'yes' } else { 'no' })" | Out-File $env:GITHUB_OUTPUT -Append
 
-          if ($needed) {
+          if ($merged) {
+            Write-Host "::notice::Program changed on main - building with yt-dlp $latest"
+          } elseif ($needed) {
             Write-Host "::notice::Update needed - building yt-dlp $latest"
           } else {
             Write-Host "::notice::Already current on yt-dlp $shipped - nothing to do"
