@@ -123,9 +123,9 @@ def diagnose(url, log_dir):
 
     output = (result.stdout or "") + (result.stderr or "")
     requests = parse_traffic(output)
-    # 404 and 429 come from YouTube itself (no such address / too many requests),
-    # not from a filter, so they aren't reported as blocked. They stay in the log.
-    rejected = [r for r in requests if r[2] >= 400 and r[2] not in (404, 429)]
+    # Only codes a filter uses count. Others (400, 404, 429, 5xx...) are YouTube's
+    # own answers, so they aren't reported as blocked - they stay in the log.
+    rejected = [r for r in requests if filter_certainty(r[2])]
     emptied = [r for r in requests if is_emptied(r)]
 
     # Save the full log so it can be shown to whoever runs the filter.
@@ -158,8 +158,7 @@ def diagnose(url, log_dir):
         address = short_address(request[1])
         if address not in seen:
             seen.add(address)
-            blocked.append({"address": address, "purpose": describe_address(address),
-                            "outcome": describe_outcome(request)})
+            blocked.append(blocked_item(address, request))
 
     lines = ["Blocked addresses - these need to be allowed for downloading to work:"]
     for item in blocked:
@@ -201,21 +200,45 @@ def describe_address(url):
 
 
 EMPTIED_OUTCOME = "It answered, but sent back nothing (filters often do this instead of refusing)."
+# The download saw the player reply unreadable: empty, or a page put in its place
+REPLACED_OUTCOME = ("It answered, but not with YouTube's reply - it came back empty or "
+                    "replaced (filters often do this instead of refusing).")
+
+
+# How sure an error code is to have come from a filter rather than YouTube.
+#   418 "I'm a teapot" - what NetFree-style filters send; YouTube never does
+#   451 "unavailable for legal reasons" - a block page by definition
+#   403 "forbidden" - filters send it, but so does YouTube (e.g. for an expired
+#       or unauthorised stream link), so it only ever counts as "possibly"
+DEFINITE_FILTER_CODES = (418, 451)
+POSSIBLE_FILTER_CODES = (403,)
+
+
+def filter_certainty(status):
+    if status in DEFINITE_FILTER_CODES:
+        return "definite"
+    if status in POSSIBLE_FILTER_CODES:
+        return "possible"
+    return None
 
 
 def describe_outcome(request):
     status = request[2]
     if is_emptied(request):
         return EMPTIED_OUTCOME
-    if status in (401, 403, 418, 451):
-        return "It was refused (code {}).".format(status)
-    if status == 404:
-        return "It said the address doesn't exist (code 404)."
-    if status == 429:
-        return "YouTube said too many requests were made - wait a while and try again (code 429)."
-    if status >= 500:
-        return "The server failed to answer (code {}).".format(status)
+    if status == 418:
+        return "It was refused (code 418 - a code filters use, never YouTube)."
+    if status == 451:
+        return "It was refused as blocked content (code 451)."
+    if status == 403:
+        return "It was refused (code 403). This may be your filter, or YouTube itself."
     return "It was refused (code {}).".format(status)
+
+
+def blocked_item(address, request):
+    return {"address": address, "purpose": describe_address(address),
+            "outcome": describe_outcome(request),
+            "certainty": "definite" if is_emptied(request) else filter_certainty(request[2])}
 
 
 # --- what to download ---------------------------------------------------------
@@ -438,6 +461,46 @@ def player_api_emptied(output):
     return "player API JSON" in output and "Failed to parse JSON" in output
 
 
+# The download's own errors when fetching the video file failed - the step the
+# connection check can't repeat, since it never downloads anything. e.g.
+#   ERROR: unable to download video data: HTTP Error 418: I'm a teapot
+#   WARNING: [download] Got error: HTTP Error 403: Forbidden. Retrying fragment 1
+_HTTP_ERROR_RE = re.compile(r"HTTP Error (\d{3})")
+
+
+def stream_block_status(output):
+    """The most filter-like error code hit while downloading the video file
+    itself, or None"""
+    found = []
+    for line in output.splitlines():
+        lowered = line.lower()
+        if "video data" in lowered or "fragment" in lowered or "[download]" in lowered:
+            match = _HTTP_ERROR_RE.search(line)
+            if match and filter_certainty(int(match.group(1))):
+                found.append(int(match.group(1)))
+    for status in DEFINITE_FILTER_CODES + POSSIBLE_FILTER_CODES:
+        if status in found:
+            return status
+    return None
+
+
+# Failures where the connection itself was cut rather than answered: a filter
+# that resets or drops connections, or a broken internet connection - from here
+# the two look the same.
+_CUT_SIGNALS = (
+    "connection reset", "connectionreseterror", "connection aborted",
+    "connectionabortederror", "remote end closed", "remotedisconnected",
+    "connection refused", "incompleteread", "ssl:", "sslerror", "certificate",
+    "getaddrinfo failed", "failed to resolve", "name resolution",
+    "nodename nor servname", "timed out", "winerror 10054", "winerror 10060",
+)
+
+
+def connection_cut(errors):
+    text = "\n".join(errors).lower()
+    return any(signal in text for signal in _CUT_SIGNALS)
+
+
 def find_downloaded_file(reported_path, download_dir, started_at):
     """The finished file's path. Uses what yt-dlp reported, and failing that the
     newest media file that appeared in the folder during this download."""
@@ -596,7 +659,7 @@ class Download:
                 self.messages.put(("error", {
                     "summary": summary,
                     "details": self._details([], [], crash=traceback.format_exc()),
-                    "secondary": summary, "blocked": [], "url": self.url,
+                    "secondary": summary, "blocked": [], "verdict": None, "url": self.url,
                 }))
 
         finally:
@@ -622,11 +685,25 @@ class Download:
             diagnosis, log_path, blocked = diagnose(self.url, self.download_dir)
             summary += "\n\n" + diagnosis
 
-        # The download itself showed the player address coming back empty, even
-        # if the re-check happened not to catch it this time
-        if player_api_emptied(output) and PLAYER_API not in [b["address"] for b in blocked]:
+        # What the download itself showed counts too, since the re-check is a
+        # second attempt that may not hit the same wall
+        addresses = [b["address"] for b in blocked]
+        if player_api_emptied(output) and PLAYER_API not in addresses:
             blocked.insert(0, {"address": PLAYER_API, "purpose": describe_address(PLAYER_API),
-                               "outcome": EMPTIED_OUTCOME})
+                               "outcome": REPLACED_OUTCOME, "certainty": "definite"})
+        stream_status = stream_block_status(output)
+        stream_address = short_address("https://x.googlevideo.com/videoplayback")
+        if stream_status and stream_address not in addresses:
+            blocked.append(blocked_item(stream_address, ("GET", stream_address, stream_status, None)))
+
+        if any(item["certainty"] == "definite" for item in blocked):
+            verdict = "blocked"
+        elif blocked:
+            verdict = "maybe_blocked"
+        elif connection_cut(errors):
+            verdict = "connection_cut"
+        else:
+            verdict = None
 
         # Shown under the blocked-addresses panel, so it leaves out the list,
         # and the panel's headline already says the download failed
@@ -638,7 +715,7 @@ class Download:
 
         return {"summary": summary, "secondary": secondary,
                 "details": self._details(errors, warnings),
-                "blocked": blocked, "url": self.url}
+                "blocked": blocked, "verdict": verdict, "url": self.url}
 
     def _details(self, errors, warnings, crash=None):
         """A plain-text report that can be copied and sent to someone"""
@@ -689,6 +766,9 @@ COLORS = {
     "warn_bg": "#fffbeb",
     "warn_border": "#f59e0b",
     "warn_text": "#92400e",
+    "info_bg": "#eff6ff",
+    "info_border": "#3b82f6",
+    "info_text": "#1e3a8a",
     "fast": "#15803d",
     "slower": "#b45309",
     "slowest": "#b91c1c",
@@ -1021,14 +1101,16 @@ class ErrorDialog:
 
     A filter blocking YouTube is the most common failure, and the one a person
     can actually get fixed, so it gets its own layout: what is going on in plain
-    words, the addresses to ask for, and a ready-made request to send."""
+    words, the addresses to ask for, and a ready-made request to send. How
+    firmly it says so depends on how strong the evidence is (see PANELS)."""
 
     def __init__(self, parent, report, show_details):
         self.report = report
         self.family = family = pick_font_family(parent)
-        blocked = report["blocked"]
+        verdict = report.get("verdict")
+        asks_filter = verdict in ("blocked", "maybe_blocked")
         window = self.window = tk.Toplevel(parent, bg=COLORS["bg"])
-        window.title("Your filter is blocking this download" if blocked else "Download failed")
+        window.title(PANELS[verdict]["title"] if verdict else "Download failed")
         window.transient(parent)
         window.minsize(600, 0)
 
@@ -1038,8 +1120,8 @@ class ErrorDialog:
         self.boxes = []
         row = 0
 
-        if blocked:
-            row = self.build_blocked(frame, blocked)
+        if verdict:
+            row = self.build_panel(frame, PANELS[verdict], report["blocked"])
             ttk.Label(frame, text="Other things to try", style="Subtitle.TLabel").grid(
                 row=row, column=0, sticky="w", pady=(16, 4))
             row += 1
@@ -1048,8 +1130,8 @@ class ErrorDialog:
                       foreground=COLORS["accent"]).grid(row=row, column=0, sticky="w", pady=(0, 10))
             row += 1
 
-        summary_box = self.text_box(frame, report["secondary"] if blocked else report["summary"],
-                                    (family, 9 if blocked else 10))
+        summary_box = self.text_box(frame, report["secondary"] if verdict else report["summary"],
+                                    (family, 9 if verdict else 10))
         summary_box.grid(row=row, column=0, sticky="we")
         row += 1
 
@@ -1075,7 +1157,7 @@ class ErrorDialog:
         buttons.columnconfigure(0, weight=1)
         self.copied = ttk.Label(buttons, style="Subtitle.TLabel")
         self.copied.grid(row=0, column=0, sticky="w")
-        if blocked:
+        if asks_filter:
             ttk.Button(buttons, text="Copy full report", style="Quiet.TButton",
                        command=self.copy_report).grid(row=0, column=1, padx=(0, 8))
             main = ttk.Button(buttons, text="Copy request for your filter provider",
@@ -1083,6 +1165,12 @@ class ErrorDialog:
             main.grid(row=0, column=2, padx=(0, 8))
             close = ttk.Button(buttons, text="Close", style="Quiet.TButton", command=window.destroy)
             close.grid(row=0, column=3, sticky="ns")
+        elif verdict:
+            main = ttk.Button(buttons, text="Copy full report", style="Accent.TButton",
+                              command=self.copy_report)
+            main.grid(row=0, column=1, padx=(0, 8))
+            close = ttk.Button(buttons, text="Close", style="Quiet.TButton", command=window.destroy)
+            close.grid(row=0, column=2, sticky="ns")
         else:
             ttk.Button(buttons, text="Copy everything", style="Quiet.TButton",
                        command=self.copy_report).grid(row=0, column=1, padx=(0, 8))
@@ -1107,33 +1195,28 @@ class ErrorDialog:
             box.configure(height=max(1, -(-pixels // line)))
         window.grab_set()
 
-    def build_blocked(self, frame, blocked):
-        """The filter-blocked panel. Returns the next free grid row."""
+    def build_panel(self, frame, config, blocked):
+        """The highlighted explanation at the top. Returns the next free grid row."""
         family, c = self.family, COLORS
-        panel = tk.Frame(frame, bg=c["warn_bg"], highlightthickness=1,
-                         highlightbackground=c["warn_border"])
+        bg, border, fg = (c[config["tone"] + "_bg"], c[config["tone"] + "_border"],
+                          c[config["tone"] + "_text"])
+        panel = tk.Frame(frame, bg=bg, highlightthickness=1, highlightbackground=border)
         panel.grid(row=0, column=0, sticky="we")
         panel.columnconfigure(1, weight=1)
-        tk.Frame(panel, bg=c["warn_border"], width=6).grid(row=0, column=0, rowspan=3, sticky="ns")
+        tk.Frame(panel, bg=border, width=6).grid(row=0, column=0, rowspan=3, sticky="ns")
 
-        tk.Label(panel, text="Your filter is blocking this download", bg=c["warn_bg"],
-                 fg=c["warn_text"], font=(family, 16, "bold"), anchor="w", justify="left"
-                 ).grid(row=0, column=1, sticky="we", padx=16, pady=(14, 6))
-        tk.Label(panel, bg=c["warn_bg"], fg=c["text"], font=(family, 10), anchor="w",
-                 justify="left", wraplength=540, text=(
-                     "The video is fine, and you didn't do anything wrong. Your internet "
-                     "filter is stopping this program from reaching parts of YouTube it "
-                     "needs, so nothing can be downloaded. Choosing a different quality "
-                     "won't help.\n\n"
-                     "To fix it, ask your filter provider to allow the addresses below. "
-                     "The red button copies a ready-made request you can paste into an "
-                     "email or their support form.")
-                 ).grid(row=1, column=1, sticky="we", padx=16, pady=(0, 12))
+        tk.Label(panel, text=config["title"], bg=bg, fg=fg, font=(family, 16, "bold"),
+                 anchor="w", justify="left").grid(row=0, column=1, sticky="we", padx=16, pady=(14, 6))
+        tk.Label(panel, bg=bg, fg=c["text"], font=(family, 10), anchor="w", justify="left",
+                 wraplength=540, text=config["text"]
+                 ).grid(row=1, column=1, sticky="we", padx=16, pady=(0, 12 if blocked else 16))
+        if not blocked:
+            return 1
 
         # The addresses, in a box whose text can be selected and copied
         box = tk.Text(panel, font=(family, 10), wrap="word", relief="flat", width=60, height=4,
                       bg=c["card"], fg=c["text"], padx=14, pady=10, highlightthickness=1,
-                      highlightbackground=c["warn_border"], highlightcolor=c["warn_border"],
+                      highlightbackground=border, highlightcolor=border,
                       selectbackground=c["accent_soft"], selectforeground=c["text"],
                       inactiveselectbackground=c["accent_soft"], cursor="xterm")
         box.tag_configure("address", font=("Consolas", 11, "bold"), spacing1=6)
@@ -1175,6 +1258,44 @@ class ErrorDialog:
     def copy_report(self):
         self.copy_text("{}\n\n{}".format(self.report["summary"], self.report["details"]),
                        "Copied - paste it into an email or message")
+
+
+# The top panel of the error window, by how sure we are a filter is the cause
+PANELS = {
+    "blocked": {
+        "tone": "warn",
+        "title": "Your filter is blocking this download",
+        "text": (
+            "The video is fine, and you didn't do anything wrong. Your internet "
+            "filter is stopping this program from reaching parts of YouTube it "
+            "needs, so nothing can be downloaded. Choosing a different quality "
+            "won't help.\n\n"
+            "To fix it, ask your filter provider to allow the addresses below. "
+            "The red button copies a ready-made request you can paste into an "
+            "email or their support form."),
+    },
+    "maybe_blocked": {
+        "tone": "info",
+        "title": "Your filter may be blocking this download",
+        "text": (
+            "Parts of YouTube refused this program. That is often a filter, but "
+            "YouTube sometimes refuses on its own too, so first try again in a "
+            "few minutes.\n\n"
+            "If it keeps happening, ask your filter provider to allow the "
+            "addresses below. The red button copies a ready-made request you can "
+            "paste into an email or their support form."),
+    },
+    "connection_cut": {
+        "tone": "info",
+        "title": "The connection to YouTube was cut",
+        "text": (
+            "Something stopped the connection part-way. Often that's a filter, "
+            "but an unreliable internet connection looks the same from here.\n\n"
+            "Check that your internet is working, then try again. If it keeps "
+            "happening, it's probably your filter: send them the full report - "
+            "the red button copies it."),
+    },
+}
 
 
 def show_in_folder(path, folder):
