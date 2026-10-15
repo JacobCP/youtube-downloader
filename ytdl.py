@@ -168,8 +168,9 @@ def diagnose(url, log_dir):
 
     if youtube_emptied and not rejected and not emptied:
         return (
-            "The connection check got an empty reply again, but it came from "
-            "YouTube's own servers - so this is YouTube, not a filter."
+            "The connection check got an empty reply again. It was labelled as "
+            "coming from YouTube's own servers, but a filter can pass that label "
+            "along, so this doesn't show which of the two emptied it."
         ), log_path, []
 
     if not rejected and not emptied:
@@ -750,9 +751,8 @@ class Download:
             verdict = "maybe_blocked"
         elif player_api_emptied(output):
             # Empty stream lookups, even after retrying another way, with no
-            # sign of a filter - and a filter blocks an address every time,
-            # while these come and go
-            verdict = "youtube_glitch"
+            # firm evidence either way: YouTube and a filter can both cause this
+            verdict = "empty_answer"
         elif connection_cut(errors):
             verdict = "connection_cut"
         else:
@@ -1107,7 +1107,7 @@ class App:
         if update["kind"] == "checking":
             self.show_stage("Checking which addresses are blocked...", indeterminate=True)
         elif update["kind"] == "retrying":
-            self.show_stage("YouTube didn't answer properly - trying another way...",
+            self.show_stage("The answer came back empty - trying another way...",
                             indeterminate=True)
         elif update["kind"] == "post":
             stage = POSTPROCESSOR_STAGES.get(update["name"])
@@ -1341,17 +1341,20 @@ PANELS = {
             "addresses below. The red button copies a ready-made request you can "
             "paste into an email or their support form."),
     },
-    "youtube_glitch": {
+    "empty_answer": {
         "tone": "info",
-        "title": "YouTube didn't answer properly",
+        "title": "YouTube's answer came back empty",
         "text": (
-            "When the program asked YouTube about this video, YouTube sent back an "
-            "empty answer - and again when it tried a second way. That is almost "
-            "always on YouTube's side rather than your filter (a filter blocks "
-            "the same way every time), and the video is probably fine.\n\n"
-            "Wait a few minutes and try again. If it keeps happening, download "
-            "the latest version of this program from tinyurl.com/youtubekosherdl - "
-            "YouTube changes often, and newer versions keep up."),
+            "When the program asked YouTube about this video, the answer came back "
+            "empty - and again when it tried a second way. That can be YouTube "
+            "having trouble, or your filter getting in the way. From here the two "
+            "look the same.\n\n"
+            "To tell which: if you can, connect to the internet without the filter "
+            "(for example through a phone hotspot) and try the same video. If it "
+            "works there, it's the filter - send them the full report (the red "
+            "button copies it). If it fails there too, it's YouTube: wait a while, "
+            "or get the latest version of this program from "
+            "tinyurl.com/youtubekosherdl."),
     },
     "connection_cut": {
         "tone": "info",

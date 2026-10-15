@@ -82,8 +82,10 @@ How firmly the error window blames the filter depends on the evidence:
 - **"Your filter may be blocking this download"** - code 403, which filters send
   but so does YouTube itself, or an empty reply from the player address that
   didn't come from Google's servers. It suggests trying again first.
-- **"YouTube didn't answer properly"** - the player address came back empty, but
-  the reply came from Google's own servers, or the re-check got a normal answer.
+- **"YouTube's answer came back empty"** - the player address came back empty,
+  with no firm evidence of who emptied it. YouTube and a filter look the same
+  here, so it doesn't take sides; it suggests trying without the filter (e.g. a
+  phone hotspot) to tell which.
 - **"The connection to YouTube was cut"** - a reset, dropped or failed connection.
   A filter can do that, but so can a bad internet connection.
 
