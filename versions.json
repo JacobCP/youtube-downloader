@@ -16,9 +16,9 @@
     "                  run and check that both video and audio downloads still work.",
     "ffmpeg_last_built written by the workflow after each build."
   ],
-  "yt_dlp": "2026.08.19",
+  "yt_dlp": "2026.10.21",
   "deno": "v2.9.5",
   "ffmpeg": "latest",
   "ffmpeg_variant": "win64-gpl",
-  "ffmpeg_last_built": "N-127527-g045dea2a34-20261014"
+  "ffmpeg_last_built": "N-127900-ge2798d5cad-20261021"
 }
